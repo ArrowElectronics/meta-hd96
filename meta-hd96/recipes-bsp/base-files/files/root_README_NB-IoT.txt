@@ -3,15 +3,15 @@
     This image for Shield96 has support for Shiratech LTE CAT-M1/NB1 96boards
 format mezzanine board. PPP connection can be started through the Quectel BG96
 module found on the mezzanine board. This image has support for Arkessa and
-1NCE SIM cards. By default the Arkessa SIM card is used.
-    If the Shiratech NB-IoT mezzanine is connected and Arkessa SIM card is
+1NCE SIM cards. By default the 1NCE SIM card is used.
+    If the Shiratech NB-IoT mezzanine is connected and 1NCE SIM card is
 inserted the following command initiates the internet connection through the
 ppp0 interface:
       # ifup ppp0
     And this command shuts it down:
       # ifdown ppp0
 
-    If the 1NCE SIM card is inserted one needs to edit
+    If the Arkessa SIM card is inserted one needs to edit
 /etc/ppp/peers/quectel-chat-connect and select the correct APN (see the given
 file for comments). If another SIM card is used one needs to modify this file
 according to the SIM card providers instructions.

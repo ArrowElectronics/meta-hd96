@@ -78,10 +78,10 @@ internet speed and require around 25GiB disk space.
     - log in to Linux as user 'root'
     - execute these:
       # ifdown eth0
-	  # ifconfig wlan0
+      # ifconfig wlan0
 
     - if the WiFi module was found the last command should display information
-	about the wlan0 interface
+    about the wlan0 interface
 
     - scanning for WiFi networks:
       # iw dev wlan0 scan | grep ssid -i
@@ -89,26 +89,26 @@ internet speed and require around 25GiB disk space.
     - connect to one SSID:
       # wpa_passphrase <SSID> <password> >> /etc/wpa_supplicant.conf
       # ifdown wlan0
-	  # ifup wlan0
+      # ifup wlan0
 
     - check connection
       # iw dev wlan0 link
 
     - if the link is esatilished UDHCP daemon will acquire IP address. The
-	internet connection can be checked by:
+    internet connection can be checked by:
       # ifconfig wlan0
       # ping amazon.com
 
     - if we want to connect to an open WiFi network the following lines need to
-	be manually added (by 'vi' or 'nano') to /etc/wpa_supplicant.conf :
-	  network={
+    be manually added (by 'vi' or 'nano') to /etc/wpa_supplicant.conf :
+      network={
         ssid="name of open WiFi network"
         key_mgmt=NONE
       }
 
     - then the wlan0 interface must be restarted:
-	  # ifdown wlan0
-	  # ifup wlan0
+      # ifdown wlan0
+      # ifup wlan0
 
     WILC1000 driver dumps a lot of LOG messages which make normal work difficult.
 But as we already have IP address it is possible to SSH into the board. On a

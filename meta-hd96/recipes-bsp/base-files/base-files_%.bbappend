@@ -38,7 +38,8 @@ do_install_append () {
     install -m 644 ${WORKDIR}/modules-load.d/* ${D}${sysconfdir}/modules-load.d/
 
     install -d ${D}${base_prefix}/home/root
-    install -m 644 ${WORKDIR}/root_* ${D}${base_prefix}/home/root/
+    install -m 644 ${WORKDIR}/root_README_WIFI.txt ${D}${base_prefix}/home/root/README_WIFI.txt
+    install -m 644 ${WORKDIR}/root_README_NB-IoT.txt ${D}${base_prefix}/home/root/README_NB-IoT
 
     install -d ${D}${sysconfdir}/ppp/peers
     install -m 644 ${WORKDIR}/ppp/peers/* ${D}${sysconfdir}/ppp/peers/
@@ -59,8 +60,8 @@ FILES_${PN} += "${sysconfdir}/iptables/share_ppp0"
 FILES_${PN} += "${sysconfdir}/network/powerkey_bg96.py"
 FILES_${PN} += "${sysconfdir}/modules-load.d/wilc-sdio.conf"
 FILES_${PN} += "${sysconfdir}/modules-load.d/ppp-generic.conf"
-FILES_${PN} += "${base_prefix}/home/root}/root_README_WIFI.txt"
-FILES_${PN} += "${base_prefix}/home/root}/root_README_NB-IoT.txt"
+FILES_${PN} += "${base_prefix}/home/root}/README_WIFI.txt"
+FILES_${PN} += "${base_prefix}/home/root}/README_NB-IoT.txt"
 FILES_${PN} += "${sysconfdir}/ppp/peers/quectel-chat-connect"
 FILES_${PN} += "${sysconfdir}/ppp/peers/quectel-chat-disconnect"
 FILES_${PN} += "${sysconfdir}/ppp/peers/quectel-ppp"
