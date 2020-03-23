@@ -13,7 +13,7 @@ simpler. See meta-atmel: https://github.com/linux4sam/meta-atmel/tree/warrior
     The required steps:
     - create a working directory and enter it
     - initialize the build folders by issuing:
-      $ repo init -u https://github.com/bkardosa/meta-hd96.git -b warrior_v1.3
+      $ repo init -u https://github.com/bkardosa/meta-hd96.git -b t1s-test
       $ repo sync
 
     - the above commands may display various warning or error messages which can be ignored if the

@@ -1,0 +1,3273 @@
+diff -Naurw ./drivers/staging/Makefile ../kernel-source/drivers/staging/Makefile
+--- ./drivers/staging/Makefile	2020-03-23 16:30:41.142812231 +0100
++++ ../kernel-source/drivers/staging/Makefile	2020-03-21 20:03:29.603239750 +0100
+@@ -37,6 +37,7 @@
+ obj-$(CONFIG_FB_TFT)		+= fbtft/
+ obj-$(CONFIG_FSL_DPAA2)		+= fsl-dpaa2/
+ obj-$(CONFIG_WILC)		+= wilc1000/
++obj-y				+= t1s/
+ obj-$(CONFIG_MOST)		+= most/
+ obj-$(CONFIG_KS7010)		+= ks7010/
+ obj-$(CONFIG_GREYBUS)		+= greybus/
+diff -Naurw ./drivers/staging/t1s/Makefile ../kernel-source/drivers/staging/t1s/Makefile
+--- ./drivers/staging/t1s/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ ../kernel-source/drivers/staging/t1s/Makefile	2020-03-21 20:00:51.380446360 +0100
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: GPL-2.0
++ccflags-y += -I$(src)/
++
++obj-m += mchp_t1s_phy.o smsc_t1s_mac.o
++
++mchp_t1s_phy-y := phy-driver/src/watson_phy.o
++smsc_t1s_mac-y := smsc95xx-drv/smsc95xx.o
++
+diff -Naurw ./drivers/staging/t1s/Makefile.old ../kernel-source/drivers/staging/t1s/Makefile.old
+--- ./drivers/staging/t1s/Makefile.old	1970-01-01 01:00:00.000000000 +0100
++++ ../kernel-source/drivers/staging/t1s/Makefile.old	2020-01-09 14:16:50.000000000 +0100
+@@ -0,0 +1,14 @@
++ifndef KDIR
++    KDIR=/lib/modules/$(shell uname -r)/build
++endif
++
++obj-m += mchp_t1s_phy.o smsc_t1s_mac.o
++
++mchp_t1s_phy-y := phy-driver/src/watson_phy.o
++smsc_t1s_mac-y := smsc95xx-drv/smsc95xx.o
++
++all:
++	$(MAKE) -C $(KDIR) M=$(PWD) modules
++
++clean:
++	$(MAKE) -C $(KDIR) M=$(PWD) clean
+diff -Naurw ./drivers/staging/t1s/phy-driver/src/watson_phy.c ../kernel-source/drivers/staging/t1s/phy-driver/src/watson_phy.c
+--- ./drivers/staging/t1s/phy-driver/src/watson_phy.c	1970-01-01 01:00:00.000000000 +0100
++++ ../kernel-source/drivers/staging/t1s/phy-driver/src/watson_phy.c	2020-01-08 08:56:16.000000000 +0100
+@@ -0,0 +1,250 @@
++/*
++ * drivers/net/phy/watson_phy.c
++ *
++ * Driver for Microchip 10BASE-T1S WATSON PHY
++ *
++ * Author: Parthiban Veerasooran
++ * Author: Jan Huber
++ *
++ * Copyright (c) 2018 Microchip Technology Inc.
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/phy.h>
++#include <linux/firmware.h>
++#include <linux/delay.h>
++
++static const struct firmware *fw_p;
++
++MODULE_DESCRIPTION("Microchip 10BASE-T1S Watson Phy driver");
++MODULE_AUTHOR("Parthiban Veerasooran <Parthiban.Veerasooran@microchip.com>");
++MODULE_AUTHOR("Jan Huber <Jan.Huber@microchip.com>");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("0.5");
++
++static int mk_u32(const u8 *ptr, u32 *value)
++{
++	*value = ptr[0] << 24 | ptr[1] << 16 | ptr[2] << 8 | ptr[3];
++	return 4;
++}
++
++static int mk_u16(const u8 *ptr, u16 *value)
++{
++	*value = ptr[0] << 8 | ptr[1];
++	return 2;
++}
++
++static void write_reg(struct phy_device *phydev, u32 addr, u16 val)
++{
++	if (addr > 0xFF)
++		phy_write_mmd(phydev, addr >> 16, addr & 0xFFFF, val);
++	else
++		phy_write(phydev, addr, val);
++}
++
++static int read_reg(struct phy_device *phydev, u32 addr)
++{
++	if (addr > 0xFF)
++		return phy_read_mmd(phydev, addr >> 16, addr & 0xFFFF);
++
++	return phy_read(phydev, addr);
++}
++
++enum { WATSON_CFG_TYPE = 1 };
++
++static const int opcode_lengts[] = { 6, 8, 10, 10, 2, 12, 12 };
++
++static bool configure_watson(struct phy_device *phydev, const u8 *ptr,
++			     const u8 *end);
++
++static int config_init(struct phy_device *phydev)
++{
++	const u8 *ptr;
++	const u8 *end;
++	u32 type, length, offset;
++	int ret = request_firmware_direct(&fw_p, "watson_config.bin", NULL);
++
++	if (ret)
++		return ret;
++
++	genphy_config_init(phydev);
++
++	phydev->speed = SPEED_10;
++	phydev->autoneg = DUPLEX_HALF;
++
++	ptr = fw_p->data;
++	end = fw_p->data + fw_p->size;
++
++	while (ptr < end) {
++		offset = ptr - fw_p->data;
++		if (ptr + 8 > end) {
++			pr_err("bad TLV format, config offset: %d\n", offset);
++			goto err;
++		}
++		ptr += mk_u32(ptr, &type);
++		ptr += mk_u32(ptr, &length);
++		if (ptr + length > end) {
++			pr_err("bad TLV length, config offset: %d\n", offset);
++			goto err;
++		}
++		if (type == WATSON_CFG_TYPE) {
++			if (!configure_watson(phydev, ptr, ptr + length))
++				goto err;
++		}
++		ptr += length;
++	}
++
++	release_firmware(fw_p);
++	return 0;
++
++err:
++	release_firmware(fw_p);
++	return -EFAULT;
++}
++
++static bool configure_watson(struct phy_device *phydev, const u8 *ptr,
++			     const u8 *end)
++{
++	u32 addr;
++	u16 mask, value, skip, reg, count, delay;
++
++	while (ptr < end) {
++		u8 op = *ptr++;
++
++		if (op >= ARRAY_SIZE(opcode_lengts)) {
++			pr_err("bad opcode: %u\n", op);
++			goto err;
++		}
++
++		if (ptr + opcode_lengts[op] > end) {
++			pr_err("bad script format\n");
++			goto err;
++		}
++
++		switch (op) {
++		case 0:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &value);
++			write_reg(phydev, addr, value);
++			break;
++		case 1:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			reg = read_reg(phydev, addr) & ~mask;
++			write_reg(phydev, addr, reg | value);
++			break;
++		case 2:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			ptr += mk_u16(ptr, &skip);
++			reg = read_reg(phydev, addr) & mask;
++			if (reg == value)
++				break;
++
++			if (!skip) {
++				pr_err("value (*%08x & %04x) == %04x is expected to be %04x\n",
++				       addr, mask, reg, value);
++				goto err;
++			}
++			ptr += skip;
++			break;
++		case 3:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			ptr += mk_u16(ptr, &skip);
++			reg = read_reg(phydev, addr) & mask;
++			if (reg != value)
++				break;
++
++			if (!skip) {
++				pr_err("value (*%08x & %04x) is not expected to be %04x\n",
++				       addr, mask, reg);
++				goto err;
++			}
++			ptr += skip;
++			break;
++		case 4:
++			ptr += mk_u16(ptr, &skip);
++			ptr += skip;
++			break;
++		case 5:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			ptr += mk_u16(ptr, &count);
++			ptr += mk_u16(ptr, &delay);
++			while ((reg = read_reg(phydev, addr) & mask) != value) {
++				if (!count) {
++					pr_err("value (*%08x & %04x) == %04x is expected to be %04x\n",
++					       addr, mask, reg, value);
++					goto err;
++				}
++				mdelay(delay);
++				count--;
++			}
++			break;
++		case 6:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			ptr += mk_u16(ptr, &count);
++			ptr += mk_u16(ptr, &delay);
++			while ((reg = read_reg(phydev, addr) & mask) == value) {
++				if (!count) {
++					pr_err("value (*%08x & %04x) is not expected to be %04x\n",
++					       addr, mask, reg);
++					goto err;
++				}
++				mdelay(delay);
++				count--;
++			}
++			break;
++		}
++
++		if (ptr > end) {
++			pr_err("bad script format\n");
++			goto err;
++		}
++	}
++
++	return true;
++
++err:
++	return false;
++}
++
++static struct phy_driver driver[] = {
++	{
++		.phy_id         = 0x0007C160,
++		.name           = "Microchip 10BASE-T1S Watson",
++		.phy_id_mask    = 0x0ffffff0,
++		.soft_reset     = genphy_soft_reset,
++		.config_init    = config_init,
++		.features       = PHY_GBIT_FEATURES | SUPPORTED_MII |
++		SUPPORTED_AUI | SUPPORTED_FIBRE |
++		SUPPORTED_BNC,
++		.config_aneg    = genphy_config_aneg,
++		.aneg_done      = genphy_aneg_done,
++		.read_status    = genphy_read_status,
++		.suspend        = genphy_suspend,
++		.resume         = genphy_resume,
++	}
++};
++
++module_phy_driver(driver);
++
++static struct mdio_device_id __maybe_unused tbl[] = {
++	{ 0x0007C160, 0x0ffffff0 },
++	{ }
++};
++
++MODULE_DEVICE_TABLE(mdio, tbl);
+diff -Naurw ./drivers/staging/t1s/README.md ../kernel-source/drivers/staging/t1s/README.md
+--- ./drivers/staging/t1s/README.md	1970-01-01 01:00:00.000000000 +0100
++++ ../kernel-source/drivers/staging/t1s/README.md	2020-01-10 15:15:42.000000000 +0100
+@@ -0,0 +1,76 @@
++# 10BASE-T1S USB Network Adapter
++
++This describes procedures for compiling the **10BASE-T1S USB Network Adapter**
++Linux drivers, configuring Ethernet devices, and testing.
++
++The procedures are tested on Raspberry PI with Linux Kernel 4.14.34.
++
++## Compile MAC and PHY drivers
++
++The build machine (native or cross platform) should have installed
++corresponding kernel headers.
++
++- compile the drivers:
++
++    This step must be done one time for given Linux kernel configuration.
++    ```
++    $ make  # creates mchp_t1s_phy.ko and smsc_t1s_mac.ko
++    ```
++
++- generate configurations for node ID 0 (master) and node ID 1 (slave):
++
++    [confidential]
++
++- copy all built `*.ko` and `*.bin` files onto rest of 10BASE-T1S nodes.
++
++## Configure master node
++
++- deploy configuration:
++    ```
++    $ sudo cp master.bin /lib/firmware/watson_config.bin
++    ```
++
++Following steps must be done manually or in the script after every boot.
++
++- load kernel objects:
++    ```
++    $ sudo insmod mchp_t1s_phy.ko
++    $ sudo insmod smsc_t1s_mac.ko
++    ```
++
++- configure 10BASE-T1S Ethernet device:
++    ```
++    $ sudo ifconfig eth1 192.168.7.1
++    ```
++
++## Configure slave node
++
++- deploy configuration:
++    ```
++    $ sudo cp slave.bin /lib/firmware/watson_config.bin
++    ```
++
++Following steps must be done manually or in the script after every boot.
++
++- load kernel objects:
++    ```
++    $ sudo insmod mchp_t1s_phy.ko
++    $ sudo insmod smsc_t1s_mac.ko
++    ```
++
++- configure 10BASE-T1S Ethernet device:
++    ```
++    $ sudo ifconfig eth1 192.168.7.2
++    ```
++
++## Note
++
++If loading the drivers or configuring the Ethernet devices make any problem,
++then kernel log (`$ dmesg`) may help to identify the root cause.
++
++## Test 10BASE-T1S network
++
++```
++$ ping 192.168.7.1  # ping master from the slave node
++$ ping 192.168.7.2  # ping slave from the master node
++```
+diff -Naurw ./drivers/staging/t1s/smsc95xx-drv/smsc95xx.c ../kernel-source/drivers/staging/t1s/smsc95xx-drv/smsc95xx.c
+--- ./drivers/staging/t1s/smsc95xx-drv/smsc95xx.c	1970-01-01 01:00:00.000000000 +0100
++++ ../kernel-source/drivers/staging/t1s/smsc95xx-drv/smsc95xx.c	2020-01-09 14:16:50.000000000 +0100
+@@ -0,0 +1,2414 @@
++ /***************************************************************************
++ *
++ * Copyright (C) 2007-2008 SMSC
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ *
++ *****************************************************************************/
++
++#include <linux/module.h>
++#include <linux/kmod.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/ethtool.h>
++#include <linux/mii.h>
++#include <linux/usb.h>
++#include <linux/bitrev.h>
++#include <linux/crc16.h>
++#include <linux/crc32.h>
++#include <linux/usb/usbnet.h>
++#include <linux/slab.h>
++#include <linux/of_net.h>
++#include <linux/mdio.h>
++#include <linux/phy.h>
++#include "smsc95xx.h"
++
++#define SMSC_CHIPNAME			"smsc95xx_t1s"
++#define SMSC_DRIVER_VERSION		"1.0.6"
++#define HS_USB_PKT_SIZE			(512)
++#define FS_USB_PKT_SIZE			(64)
++#define DEFAULT_HS_BURST_CAP_SIZE	(16 * 1024 + 5 * HS_USB_PKT_SIZE)
++#define DEFAULT_FS_BURST_CAP_SIZE	(6 * 1024 + 33 * FS_USB_PKT_SIZE)
++#define DEFAULT_BULK_IN_DELAY		(0x00002000)
++#define MAX_SINGLE_PACKET_SIZE		(2048)
++#define LAN95XX_EEPROM_MAGIC		(0x9500)
++#define EEPROM_MAC_OFFSET		(0x01)
++#define DEFAULT_TX_CSUM_ENABLE		(true)
++#define DEFAULT_RX_CSUM_ENABLE		(true)
++#define SMSC95XX_INTERNAL_PHY_ID	(1)
++#define SMSC95XX_TX_OVERHEAD		(8)
++#define SMSC95XX_TX_OVERHEAD_CSUM	(12)
++#define SUPPORTED_WAKE			(WAKE_PHY | WAKE_UCAST | WAKE_BCAST | \
++					 WAKE_MCAST | WAKE_ARP | WAKE_MAGIC)
++
++#define FEATURE_8_WAKEUP_FILTERS	(0x01)
++#define FEATURE_PHY_NLP_CROSSOVER	(0x02)
++#define FEATURE_REMOTE_WAKEUP		(0x04)
++
++#define SUSPEND_SUSPEND0		(0x01)
++#define SUSPEND_SUSPEND1		(0x02)
++#define SUSPEND_SUSPEND2		(0x04)
++#define SUSPEND_SUSPEND3		(0x08)
++#define SUSPEND_ALLMODES		(SUSPEND_SUSPEND0 | SUSPEND_SUSPEND1 | \
++					 SUSPEND_SUSPEND2 | SUSPEND_SUSPEND3)
++#define MAC_ADDR_LEN                    (6)
++
++#define CARRIER_CHECK_DELAY (2 * HZ)
++
++struct smsc95xx_priv {
++	u32 chip_id;
++	u32 mac_cr;
++	u32 hash_hi;
++	u32 hash_lo;
++	u32 wolopts;
++	spinlock_t mac_cr_lock;
++	u8 features;
++	u8 suspend_flags;
++	u8 mdix_ctrl;
++	bool link_ok;
++	struct delayed_work carrier_check;
++	struct usbnet *dev;
++	struct mii_bus *mdiobus;
++};
++
++static bool turbo_mode = true;
++module_param(turbo_mode, bool, 0644);
++MODULE_PARM_DESC(turbo_mode, "Enable multiple frames per Rx transaction");
++
++static bool truesize_mode = false;
++module_param(truesize_mode, bool, 0644);
++MODULE_PARM_DESC(truesize_mode, "Report larger truesize value");
++
++static int packetsize = 2560;
++module_param(packetsize, int, 0644);
++MODULE_PARM_DESC(packetsize, "Override the RX URB packet size");
++
++static char *macaddr = ":";
++module_param(macaddr, charp, 0);
++MODULE_PARM_DESC(macaddr, "MAC address");
++
++static int __must_check __smsc95xx_read_reg(struct usbnet *dev, u32 index,
++					    u32 *data, int in_pm)
++{
++	u32 buf;
++	int ret;
++	int (*fn)(struct usbnet *, u8, u8, u16, u16, void *, u16);
++
++	BUG_ON(!dev);
++
++	if (!in_pm)
++		fn = usbnet_read_cmd;
++	else
++		fn = usbnet_read_cmd_nopm;
++
++	ret = fn(dev, USB_VENDOR_REQUEST_READ_REGISTER, USB_DIR_IN
++		 | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
++		 0, index, &buf, 4);
++	if (unlikely(ret < 0)) {
++		netdev_warn(dev->net, "Failed to read reg index 0x%08x: %d\n",
++			    index, ret);
++		return ret;
++	}
++
++	le32_to_cpus(&buf);
++	*data = buf;
++
++	return ret;
++}
++
++static int __must_check __smsc95xx_write_reg(struct usbnet *dev, u32 index,
++					     u32 data, int in_pm)
++{
++	u32 buf;
++	int ret;
++	int (*fn)(struct usbnet *, u8, u8, u16, u16, const void *, u16);
++
++	BUG_ON(!dev);
++
++	if (!in_pm)
++		fn = usbnet_write_cmd;
++	else
++		fn = usbnet_write_cmd_nopm;
++
++	buf = data;
++	cpu_to_le32s(&buf);
++
++	ret = fn(dev, USB_VENDOR_REQUEST_WRITE_REGISTER, USB_DIR_OUT
++		 | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
++		 0, index, &buf, 4);
++	if (unlikely(ret < 0))
++		netdev_warn(dev->net, "Failed to write reg index 0x%08x: %d\n",
++			    index, ret);
++
++	return ret;
++}
++
++static int __must_check smsc95xx_read_reg_nopm(struct usbnet *dev, u32 index,
++					       u32 *data)
++{
++	return __smsc95xx_read_reg(dev, index, data, 1);
++}
++
++static int __must_check smsc95xx_write_reg_nopm(struct usbnet *dev, u32 index,
++						u32 data)
++{
++	return __smsc95xx_write_reg(dev, index, data, 1);
++}
++
++static int __must_check smsc95xx_read_reg(struct usbnet *dev, u32 index,
++					  u32 *data)
++{
++	return __smsc95xx_read_reg(dev, index, data, 0);
++}
++
++static int __must_check smsc95xx_write_reg(struct usbnet *dev, u32 index,
++					   u32 data)
++{
++	return __smsc95xx_write_reg(dev, index, data, 0);
++}
++
++/* Loop until the read is completed with timeout
++ * called with phy_mutex held */
++static int __must_check __smsc95xx_phy_wait_not_busy(struct usbnet *dev,
++						     int in_pm)
++{
++	unsigned long start_time = jiffies;
++	u32 val;
++	int ret;
++
++	do {
++		ret = __smsc95xx_read_reg(dev, MII_ADDR, &val, in_pm);
++		if (ret < 0) {
++			netdev_warn(dev->net, "Error reading MII_ACCESS\n");
++			return ret;
++		}
++
++		if (!(val & MII_BUSY_))
++			return 0;
++	} while (!time_after(jiffies, start_time + HZ));
++
++	return -EIO;
++}
++
++static int __smsc95xx_mdio_read(struct net_device *netdev, int phy_id, int idx,
++				int in_pm)
++{
++	struct usbnet *dev = netdev_priv(netdev);
++	u32 val, addr;
++	int ret;
++
++	mutex_lock(&dev->phy_mutex);
++
++	/* confirm MII not busy */
++	ret = __smsc95xx_phy_wait_not_busy(dev, in_pm);
++	if (ret < 0) {
++		netdev_warn(dev->net, "MII is busy in smsc95xx_mdio_read\n");
++		goto done;
++	}
++
++	/* set the address, index & direction (read from PHY) */
++	phy_id &= dev->mii.phy_id_mask;
++	idx &= dev->mii.reg_num_mask;
++	addr = (phy_id << 11) | (idx << 6) | MII_READ_ | MII_BUSY_;
++	ret = __smsc95xx_write_reg(dev, MII_ADDR, addr, in_pm);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Error writing MII_ADDR\n");
++		goto done;
++	}
++
++	ret = __smsc95xx_phy_wait_not_busy(dev, in_pm);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Timed out reading MII reg %02X\n", idx);
++		goto done;
++	}
++
++	ret = __smsc95xx_read_reg(dev, MII_DATA, &val, in_pm);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Error reading MII_DATA\n");
++		goto done;
++	}
++
++	ret = (u16)(val & 0xFFFF);
++
++done:
++	mutex_unlock(&dev->phy_mutex);
++	return ret;
++}
++
++static void __smsc95xx_mdio_write(struct net_device *netdev, int phy_id,
++				  int idx, int regval, int in_pm)
++{
++	struct usbnet *dev = netdev_priv(netdev);
++	u32 val, addr;
++	int ret;
++
++	mutex_lock(&dev->phy_mutex);
++
++	/* confirm MII not busy */
++	ret = __smsc95xx_phy_wait_not_busy(dev, in_pm);
++	if (ret < 0) {
++		netdev_warn(dev->net, "MII is busy in smsc95xx_mdio_write\n");
++		goto done;
++	}
++
++	val = regval;
++	ret = __smsc95xx_write_reg(dev, MII_DATA, val, in_pm);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Error writing MII_DATA\n");
++		goto done;
++	}
++
++	/* set the address, index & direction (write to PHY) */
++	phy_id &= dev->mii.phy_id_mask;
++	idx &= dev->mii.reg_num_mask;
++	addr = (phy_id << 11) | (idx << 6) | MII_WRITE_ | MII_BUSY_;
++	ret = __smsc95xx_write_reg(dev, MII_ADDR, addr, in_pm);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Error writing MII_ADDR\n");
++		goto done;
++	}
++
++	ret = __smsc95xx_phy_wait_not_busy(dev, in_pm);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Timed out writing MII reg %02X\n", idx);
++		goto done;
++	}
++
++done:
++	mutex_unlock(&dev->phy_mutex);
++}
++
++static int smsc95xx_mdio_read_nopm(struct net_device *netdev, int phy_id,
++				   int idx)
++{
++	return __smsc95xx_mdio_read(netdev, phy_id, idx, 1);
++}
++
++static void smsc95xx_mdio_write_nopm(struct net_device *netdev, int phy_id,
++				     int idx, int regval)
++{
++	__smsc95xx_mdio_write(netdev, phy_id, idx, regval, 1);
++}
++
++static int smsc95xx_mdio_read(struct net_device *netdev, int phy_id, int idx)
++{
++	return __smsc95xx_mdio_read(netdev, phy_id, idx, 0);
++}
++
++static void smsc95xx_mdio_write(struct net_device *netdev, int phy_id, int idx,
++				int regval)
++{
++	__smsc95xx_mdio_write(netdev, phy_id, idx, regval, 0);
++}
++
++static int __must_check smsc95xx_wait_eeprom(struct usbnet *dev)
++{
++	unsigned long start_time = jiffies;
++	u32 val;
++	int ret;
++
++	do {
++		ret = smsc95xx_read_reg(dev, E2P_CMD, &val);
++		if (ret < 0) {
++			netdev_warn(dev->net, "Error reading E2P_CMD\n");
++			return ret;
++		}
++
++		if (!(val & E2P_CMD_BUSY_) || (val & E2P_CMD_TIMEOUT_))
++			break;
++		udelay(40);
++	} while (!time_after(jiffies, start_time + HZ));
++
++	if (val & (E2P_CMD_TIMEOUT_ | E2P_CMD_BUSY_)) {
++		netdev_warn(dev->net, "EEPROM read operation timeout\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int __must_check smsc95xx_eeprom_confirm_not_busy(struct usbnet *dev)
++{
++	unsigned long start_time = jiffies;
++	u32 val;
++	int ret;
++
++	do {
++		ret = smsc95xx_read_reg(dev, E2P_CMD, &val);
++		if (ret < 0) {
++			netdev_warn(dev->net, "Error reading E2P_CMD\n");
++			return ret;
++		}
++
++		if (!(val & E2P_CMD_BUSY_))
++			return 0;
++
++		udelay(40);
++	} while (!time_after(jiffies, start_time + HZ));
++
++	netdev_warn(dev->net, "EEPROM is busy\n");
++	return -EIO;
++}
++
++static int smsc95xx_read_eeprom(struct usbnet *dev, u32 offset, u32 length,
++				u8 *data)
++{
++	u32 val;
++	int i, ret;
++
++	BUG_ON(!dev);
++	BUG_ON(!data);
++
++	ret = smsc95xx_eeprom_confirm_not_busy(dev);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < length; i++) {
++		val = E2P_CMD_BUSY_ | E2P_CMD_READ_ | (offset & E2P_CMD_ADDR_);
++		ret = smsc95xx_write_reg(dev, E2P_CMD, val);
++		if (ret < 0) {
++			netdev_warn(dev->net, "Error writing E2P_CMD\n");
++			return ret;
++		}
++
++		ret = smsc95xx_wait_eeprom(dev);
++		if (ret < 0)
++			return ret;
++
++		ret = smsc95xx_read_reg(dev, E2P_DATA, &val);
++		if (ret < 0) {
++			netdev_warn(dev->net, "Error reading E2P_DATA\n");
++			return ret;
++		}
++
++		data[i] = val & 0xFF;
++		offset++;
++	}
++
++	return 0;
++}
++
++static int smsc95xx_write_eeprom(struct usbnet *dev, u32 offset, u32 length,
++				 u8 *data)
++{
++	u32 val;
++	int i, ret;
++
++	BUG_ON(!dev);
++	BUG_ON(!data);
++
++	ret = smsc95xx_eeprom_confirm_not_busy(dev);
++	if (ret)
++		return ret;
++
++	/* Issue write/erase enable command */
++	val = E2P_CMD_BUSY_ | E2P_CMD_EWEN_;
++	ret = smsc95xx_write_reg(dev, E2P_CMD, val);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Error writing E2P_DATA\n");
++		return ret;
++	}
++
++	ret = smsc95xx_wait_eeprom(dev);
++	if (ret < 0)
++		return ret;
++
++	for (i = 0; i < length; i++) {
++
++		/* Fill data register */
++		val = data[i];
++		ret = smsc95xx_write_reg(dev, E2P_DATA, val);
++		if (ret < 0) {
++			netdev_warn(dev->net, "Error writing E2P_DATA\n");
++			return ret;
++		}
++
++		/* Send "write" command */
++		val = E2P_CMD_BUSY_ | E2P_CMD_WRITE_ | (offset & E2P_CMD_ADDR_);
++		ret = smsc95xx_write_reg(dev, E2P_CMD, val);
++		if (ret < 0) {
++			netdev_warn(dev->net, "Error writing E2P_CMD\n");
++			return ret;
++		}
++
++		ret = smsc95xx_wait_eeprom(dev);
++		if (ret < 0)
++			return ret;
++
++		offset++;
++	}
++
++	return 0;
++}
++
++static int __must_check smsc95xx_write_reg_async(struct usbnet *dev, u16 index,
++						 u32 data)
++{
++	const u16 size = 4;
++	u32 buf;
++	int ret;
++
++	buf = data;
++	cpu_to_le32s(&buf);
++
++	ret = usbnet_write_cmd_async(dev, USB_VENDOR_REQUEST_WRITE_REGISTER,
++				     USB_DIR_OUT | USB_TYPE_VENDOR |
++				     USB_RECIP_DEVICE,
++				     0, index, &buf, size);
++	if (ret < 0)
++		netdev_warn(dev->net, "Error write async cmd, sts=%d\n",
++			    ret);
++	return ret;
++}
++
++/* returns hash bit number for given MAC address
++ * example:
++ * 01 00 5E 00 00 01 -> returns bit number 31 */
++static unsigned int smsc95xx_hash(char addr[ETH_ALEN])
++{
++	return (ether_crc(ETH_ALEN, addr) >> 26) & 0x3f;
++}
++
++static void smsc95xx_set_multicast(struct net_device *netdev)
++{
++	struct usbnet *dev = netdev_priv(netdev);
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	unsigned long flags;
++	int ret;
++
++	pdata->hash_hi = 0;
++	pdata->hash_lo = 0;
++
++	spin_lock_irqsave(&pdata->mac_cr_lock, flags);
++
++	if (dev->net->flags & IFF_PROMISC) {
++		netif_dbg(dev, drv, dev->net, "promiscuous mode enabled\n");
++		pdata->mac_cr |= MAC_CR_PRMS_;
++		pdata->mac_cr &= ~(MAC_CR_MCPAS_ | MAC_CR_HPFILT_);
++	} else if (dev->net->flags & IFF_ALLMULTI) {
++		netif_dbg(dev, drv, dev->net, "receive all multicast enabled\n");
++		pdata->mac_cr |= MAC_CR_MCPAS_;
++		pdata->mac_cr &= ~(MAC_CR_PRMS_ | MAC_CR_HPFILT_);
++	} else if (!netdev_mc_empty(dev->net)) {
++		struct netdev_hw_addr *ha;
++
++		pdata->mac_cr |= MAC_CR_HPFILT_;
++		pdata->mac_cr &= ~(MAC_CR_PRMS_ | MAC_CR_MCPAS_);
++
++		netdev_for_each_mc_addr(ha, netdev) {
++			u32 bitnum = smsc95xx_hash(ha->addr);
++			u32 mask = 0x01 << (bitnum & 0x1F);
++			if (bitnum & 0x20)
++				pdata->hash_hi |= mask;
++			else
++				pdata->hash_lo |= mask;
++		}
++
++		netif_dbg(dev, drv, dev->net, "HASHH=0x%08X, HASHL=0x%08X\n",
++				   pdata->hash_hi, pdata->hash_lo);
++	} else {
++		netif_dbg(dev, drv, dev->net, "receive own packets only\n");
++		pdata->mac_cr &=
++			~(MAC_CR_PRMS_ | MAC_CR_MCPAS_ | MAC_CR_HPFILT_);
++	}
++
++	spin_unlock_irqrestore(&pdata->mac_cr_lock, flags);
++
++	/* Initiate async writes, as we can't wait for completion here */
++	ret = smsc95xx_write_reg_async(dev, HASHH, pdata->hash_hi);
++	if (ret < 0)
++		netdev_warn(dev->net, "failed to initiate async write to HASHH\n");
++
++	ret = smsc95xx_write_reg_async(dev, HASHL, pdata->hash_lo);
++	if (ret < 0)
++		netdev_warn(dev->net, "failed to initiate async write to HASHL\n");
++
++	ret = smsc95xx_write_reg_async(dev, MAC_CR, pdata->mac_cr);
++	if (ret < 0)
++		netdev_warn(dev->net, "failed to initiate async write to MAC_CR\n");
++}
++
++static int smsc95xx_phy_update_flowcontrol(struct usbnet *dev, u8 duplex,
++					   u16 lcladv, u16 rmtadv)
++{
++	u32 flow = 0, afc_cfg;
++
++	int ret = smsc95xx_read_reg(dev, AFC_CFG, &afc_cfg);
++	if (ret < 0)
++		return ret;
++
++	if (duplex == DUPLEX_FULL) {
++		u8 cap = mii_resolve_flowctrl_fdx(lcladv, rmtadv);
++
++		if (cap & FLOW_CTRL_RX)
++			flow = 0xFFFF0002;
++
++		if (cap & FLOW_CTRL_TX) {
++			afc_cfg |= 0xF;
++			flow |= 0xFFFF0000;
++		} else {
++			afc_cfg &= ~0xF;
++		}
++
++		netif_dbg(dev, link, dev->net, "rx pause %s, tx pause %s\n",
++				   cap & FLOW_CTRL_RX ? "enabled" : "disabled",
++				   cap & FLOW_CTRL_TX ? "enabled" : "disabled");
++	} else {
++		netif_dbg(dev, link, dev->net, "half duplex\n");
++		afc_cfg |= 0xF;
++	}
++
++	ret = smsc95xx_write_reg(dev, FLOW, flow);
++	if (ret < 0)
++		return ret;
++
++	return smsc95xx_write_reg(dev, AFC_CFG, afc_cfg);
++}
++
++static int smsc95xx_link_reset(struct usbnet *dev)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	struct mii_if_info *mii = &dev->mii;
++	struct ethtool_cmd ecmd = { .cmd = ETHTOOL_GSET };
++	unsigned long flags;
++	u16 lcladv, rmtadv;
++	int ret;
++
++	/* clear interrupt status */
++	ret = smsc95xx_mdio_read(dev->net, mii->phy_id, PHY_INT_SRC);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_write_reg(dev, INT_STS, INT_STS_CLEAR_ALL_);
++	if (ret < 0)
++		return ret;
++
++	mii_check_media(mii, 1, 1);
++	mii_ethtool_gset(&dev->mii, &ecmd);
++	lcladv = smsc95xx_mdio_read(dev->net, mii->phy_id, MII_ADVERTISE);
++	rmtadv = smsc95xx_mdio_read(dev->net, mii->phy_id, MII_LPA);
++
++	netif_dbg(dev, link, dev->net,
++		  "speed: %u duplex: %d lcladv: %04x rmtadv: %04x\n",
++		  ethtool_cmd_speed(&ecmd), ecmd.duplex, lcladv, rmtadv);
++
++	spin_lock_irqsave(&pdata->mac_cr_lock, flags);
++	if (ecmd.duplex != DUPLEX_FULL) {
++		pdata->mac_cr &= ~MAC_CR_FDPX_;
++		pdata->mac_cr |= MAC_CR_RCVOWN_;
++	} else {
++		pdata->mac_cr &= ~MAC_CR_RCVOWN_;
++		pdata->mac_cr |= MAC_CR_FDPX_;
++	}
++	spin_unlock_irqrestore(&pdata->mac_cr_lock, flags);
++
++	ret = smsc95xx_write_reg(dev, MAC_CR, pdata->mac_cr);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_phy_update_flowcontrol(dev, ecmd.duplex, lcladv, rmtadv);
++	if (ret < 0)
++		netdev_warn(dev->net, "Error updating PHY flow control\n");
++
++	return ret;
++}
++
++static void smsc95xx_status(struct usbnet *dev, struct urb *urb)
++{
++	u32 intdata;
++
++	if (urb->actual_length != 4) {
++		netdev_warn(dev->net, "unexpected urb length %d\n",
++			    urb->actual_length);
++		return;
++	}
++
++	memcpy(&intdata, urb->transfer_buffer, 4);
++	le32_to_cpus(&intdata);
++
++	netif_dbg(dev, link, dev->net, "intdata: 0x%08X\n", intdata);
++
++	if (intdata & INT_ENP_PHY_INT_)
++		usbnet_defer_kevent(dev, EVENT_LINK_RESET);
++	else
++		netdev_warn(dev->net, "unexpected interrupt, intdata=0x%08X\n",
++			    intdata);
++}
++
++static void set_carrier(struct usbnet *dev, bool link)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++
++	if (pdata->link_ok == link)
++		return;
++
++	pdata->link_ok = link;
++
++	if (link)
++		usbnet_link_change(dev, 1, 0);
++	else
++		usbnet_link_change(dev, 0, 0);
++}
++
++static void check_carrier(struct work_struct *work)
++{
++	struct smsc95xx_priv *pdata = container_of(work, struct smsc95xx_priv,
++						carrier_check.work);
++	struct usbnet *dev = pdata->dev;
++	int ret;
++
++	if (pdata->suspend_flags != 0)
++		return;
++
++	ret = smsc95xx_mdio_read(dev->net, dev->mii.phy_id, MII_BMSR);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Failed to read MII_BMSR\n");
++		return;
++	}
++	if (ret & BMSR_LSTATUS)
++		set_carrier(dev, 1);
++	else
++		set_carrier(dev, 0);
++
++	schedule_delayed_work(&pdata->carrier_check, CARRIER_CHECK_DELAY);
++}
++
++/* Enable or disable Tx & Rx checksum offload engines */
++static int smsc95xx_set_features(struct net_device *netdev,
++	netdev_features_t features)
++{
++	struct usbnet *dev = netdev_priv(netdev);
++	u32 read_buf;
++	int ret;
++
++	ret = smsc95xx_read_reg(dev, COE_CR, &read_buf);
++	if (ret < 0)
++		return ret;
++
++	if (features & NETIF_F_IP_CSUM)
++		read_buf |= Tx_COE_EN_;
++	else
++		read_buf &= ~Tx_COE_EN_;
++
++	if (features & NETIF_F_RXCSUM)
++		read_buf |= Rx_COE_EN_;
++	else
++		read_buf &= ~Rx_COE_EN_;
++
++	ret = smsc95xx_write_reg(dev, COE_CR, read_buf);
++	if (ret < 0)
++		return ret;
++
++	netif_dbg(dev, hw, dev->net, "COE_CR = 0x%08x\n", read_buf);
++	return 0;
++}
++
++static int smsc95xx_ethtool_get_eeprom_len(struct net_device *net)
++{
++	return MAX_EEPROM_SIZE;
++}
++
++static int smsc95xx_ethtool_get_eeprom(struct net_device *netdev,
++				       struct ethtool_eeprom *ee, u8 *data)
++{
++	struct usbnet *dev = netdev_priv(netdev);
++
++	ee->magic = LAN95XX_EEPROM_MAGIC;
++
++	return smsc95xx_read_eeprom(dev, ee->offset, ee->len, data);
++}
++
++static int smsc95xx_ethtool_set_eeprom(struct net_device *netdev,
++				       struct ethtool_eeprom *ee, u8 *data)
++{
++	struct usbnet *dev = netdev_priv(netdev);
++
++	if (ee->magic != LAN95XX_EEPROM_MAGIC) {
++		netdev_warn(dev->net, "EEPROM: magic value mismatch, magic = 0x%x\n",
++			    ee->magic);
++		return -EINVAL;
++	}
++
++	return smsc95xx_write_eeprom(dev, ee->offset, ee->len, data);
++}
++
++static int smsc95xx_ethtool_getregslen(struct net_device *netdev)
++{
++	/* all smsc95xx registers */
++	return COE_CR - ID_REV + sizeof(u32);
++}
++
++static void
++smsc95xx_ethtool_getregs(struct net_device *netdev, struct ethtool_regs *regs,
++			 void *buf)
++{
++	struct usbnet *dev = netdev_priv(netdev);
++	unsigned int i, j;
++	int retval;
++	u32 *data = buf;
++
++	retval = smsc95xx_read_reg(dev, ID_REV, &regs->version);
++	if (retval < 0) {
++		netdev_warn(netdev, "REGS: cannot read ID_REV\n");
++		return;
++	}
++
++	for (i = ID_REV, j = 0; i <= COE_CR; i += (sizeof(u32)), j++) {
++		retval = smsc95xx_read_reg(dev, i, &data[j]);
++		if (retval < 0) {
++			netdev_warn(netdev, "REGS: cannot read reg[%x]\n", i);
++			return;
++		}
++	}
++}
++
++static void smsc95xx_ethtool_get_wol(struct net_device *net,
++				     struct ethtool_wolinfo *wolinfo)
++{
++	struct usbnet *dev = netdev_priv(net);
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++
++	wolinfo->supported = SUPPORTED_WAKE;
++	wolinfo->wolopts = pdata->wolopts;
++}
++
++static int smsc95xx_ethtool_set_wol(struct net_device *net,
++				    struct ethtool_wolinfo *wolinfo)
++{
++	struct usbnet *dev = netdev_priv(net);
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	int ret;
++
++	pdata->wolopts = wolinfo->wolopts & SUPPORTED_WAKE;
++
++	ret = device_set_wakeup_enable(&dev->udev->dev, pdata->wolopts);
++	if (ret < 0)
++		netdev_warn(dev->net, "device_set_wakeup_enable error %d\n", ret);
++
++	return ret;
++}
++
++static int get_mdix_status(struct net_device *net)
++{
++	struct usbnet *dev = netdev_priv(net);
++	u32 val;
++	int buf;
++
++	buf = smsc95xx_mdio_read(dev->net, dev->mii.phy_id, SPECIAL_CTRL_STS);
++	if (buf & SPECIAL_CTRL_STS_OVRRD_AMDIX_) {
++		if (buf & SPECIAL_CTRL_STS_AMDIX_ENABLE_)
++			return ETH_TP_MDI_AUTO;
++		else if (buf & SPECIAL_CTRL_STS_AMDIX_STATE_)
++			return ETH_TP_MDI_X;
++	} else {
++		buf = smsc95xx_read_reg(dev, STRAP_STATUS, &val);
++		if (val & STRAP_STATUS_AMDIX_EN_)
++			return ETH_TP_MDI_AUTO;
++	}
++
++	return ETH_TP_MDI;
++}
++
++static void set_mdix_status(struct net_device *net, __u8 mdix_ctrl)
++{
++	struct usbnet *dev = netdev_priv(net);
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	int buf;
++
++	if ((pdata->chip_id == ID_REV_CHIP_ID_9500A_) ||
++	    (pdata->chip_id == ID_REV_CHIP_ID_9530_) ||
++	    (pdata->chip_id == ID_REV_CHIP_ID_89530_) ||
++	    (pdata->chip_id == ID_REV_CHIP_ID_9730_)) {
++		/* Extend Manual AutoMDIX timer for 9500A/9500Ai */
++		buf = smsc95xx_mdio_read(dev->net, dev->mii.phy_id,
++					 PHY_EDPD_CONFIG);
++		buf |= PHY_EDPD_CONFIG_EXT_CROSSOVER_;
++		smsc95xx_mdio_write(dev->net, dev->mii.phy_id,
++				    PHY_EDPD_CONFIG, buf);
++	}
++
++	if (mdix_ctrl == ETH_TP_MDI) {
++		buf = smsc95xx_mdio_read(dev->net, dev->mii.phy_id,
++					 SPECIAL_CTRL_STS);
++		buf |= SPECIAL_CTRL_STS_OVRRD_AMDIX_;
++		buf &= ~(SPECIAL_CTRL_STS_AMDIX_ENABLE_ |
++			 SPECIAL_CTRL_STS_AMDIX_STATE_);
++		smsc95xx_mdio_write(dev->net, dev->mii.phy_id,
++				    SPECIAL_CTRL_STS, buf);
++	} else if (mdix_ctrl == ETH_TP_MDI_X) {
++		buf = smsc95xx_mdio_read(dev->net, dev->mii.phy_id,
++					 SPECIAL_CTRL_STS);
++		buf |= SPECIAL_CTRL_STS_OVRRD_AMDIX_;
++		buf &= ~(SPECIAL_CTRL_STS_AMDIX_ENABLE_ |
++			 SPECIAL_CTRL_STS_AMDIX_STATE_);
++		buf |= SPECIAL_CTRL_STS_AMDIX_STATE_;
++		smsc95xx_mdio_write(dev->net, dev->mii.phy_id,
++				    SPECIAL_CTRL_STS, buf);
++	} else if (mdix_ctrl == ETH_TP_MDI_AUTO) {
++		buf = smsc95xx_mdio_read(dev->net, dev->mii.phy_id,
++					 SPECIAL_CTRL_STS);
++		buf &= ~SPECIAL_CTRL_STS_OVRRD_AMDIX_;
++		buf &= ~(SPECIAL_CTRL_STS_AMDIX_ENABLE_ |
++			 SPECIAL_CTRL_STS_AMDIX_STATE_);
++		buf |= SPECIAL_CTRL_STS_AMDIX_ENABLE_;
++		smsc95xx_mdio_write(dev->net, dev->mii.phy_id,
++				    SPECIAL_CTRL_STS, buf);
++	}
++	pdata->mdix_ctrl = mdix_ctrl;
++}
++
++static int smsc95xx_get_link_ksettings(struct net_device *net,
++				       struct ethtool_link_ksettings *cmd)
++{
++	struct usbnet *dev = netdev_priv(net);
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	int retval;
++
++	retval = usbnet_get_link_ksettings(net, cmd);
++
++	cmd->base.eth_tp_mdix = pdata->mdix_ctrl;
++	cmd->base.eth_tp_mdix_ctrl = pdata->mdix_ctrl;
++
++	return retval;
++}
++
++static int smsc95xx_set_link_ksettings(struct net_device *net,
++				       const struct ethtool_link_ksettings *cmd)
++{
++	struct usbnet *dev = netdev_priv(net);
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	int retval;
++
++	if (pdata->mdix_ctrl != cmd->base.eth_tp_mdix_ctrl)
++		set_mdix_status(net, cmd->base.eth_tp_mdix_ctrl);
++
++	retval = usbnet_set_link_ksettings(net, cmd);
++
++	return retval;
++}
++
++static const struct ethtool_ops smsc95xx_ethtool_ops = {
++	.get_link	= usbnet_get_link,
++	.nway_reset	= usbnet_nway_reset,
++	.get_drvinfo	= usbnet_get_drvinfo,
++	.get_msglevel	= usbnet_get_msglevel,
++	.set_msglevel	= usbnet_set_msglevel,
++	.get_eeprom_len	= smsc95xx_ethtool_get_eeprom_len,
++	.get_eeprom	= smsc95xx_ethtool_get_eeprom,
++	.set_eeprom	= smsc95xx_ethtool_set_eeprom,
++	.get_regs_len	= smsc95xx_ethtool_getregslen,
++	.get_regs	= smsc95xx_ethtool_getregs,
++	.get_wol	= smsc95xx_ethtool_get_wol,
++	.set_wol	= smsc95xx_ethtool_set_wol,
++	.get_link_ksettings	= smsc95xx_get_link_ksettings,
++	.set_link_ksettings	= smsc95xx_set_link_ksettings,
++	.get_ts_info	= ethtool_op_get_ts_info,
++};
++
++static int smsc95xx_ioctl(struct net_device *netdev, struct ifreq *rq, int cmd)
++{
++	struct usbnet *dev = netdev_priv(netdev);
++
++	if (!netif_running(netdev))
++		return -EINVAL;
++
++	return generic_mii_ioctl(&dev->mii, if_mii(rq), cmd, NULL);
++}
++
++/* Check the macaddr module parameter for a MAC address */
++static int smsc95xx_is_macaddr_param(struct usbnet *dev, u8 *dev_mac)
++{
++       int i, j, got_num, num;
++       u8 mtbl[MAC_ADDR_LEN];
++
++       if (macaddr[0] == ':')
++               return 0;
++
++       i = 0;
++       j = 0;
++       num = 0;
++       got_num = 0;
++       while (j < MAC_ADDR_LEN) {
++               if (macaddr[i] && macaddr[i] != ':') {
++                       got_num++;
++                       if ('0' <= macaddr[i] && macaddr[i] <= '9')
++                               num = num * 16 + macaddr[i] - '0';
++                       else if ('A' <= macaddr[i] && macaddr[i] <= 'F')
++                               num = num * 16 + 10 + macaddr[i] - 'A';
++                       else if ('a' <= macaddr[i] && macaddr[i] <= 'f')
++                               num = num * 16 + 10 + macaddr[i] - 'a';
++                       else
++                               break;
++                       i++;
++               } else if (got_num == 2) {
++                       mtbl[j++] = (u8) num;
++                       num = 0;
++                       got_num = 0;
++                       i++;
++               } else {
++                       break;
++               }
++       }
++
++       if (j == MAC_ADDR_LEN) {
++               netif_dbg(dev, ifup, dev->net, "Overriding MAC address with: "
++               "%02x:%02x:%02x:%02x:%02x:%02x\n", mtbl[0], mtbl[1], mtbl[2],
++                                               mtbl[3], mtbl[4], mtbl[5]);
++               for (i = 0; i < MAC_ADDR_LEN; i++)
++                       dev_mac[i] = mtbl[i];
++               return 1;
++       } else {
++               return 0;
++       }
++}
++
++static void smsc95xx_init_mac_address(struct usbnet *dev)
++{
++	const u8 *mac_addr;
++
++	/* maybe the boot loader passed the MAC address in devicetree */
++	mac_addr = of_get_mac_address(dev->udev->dev.of_node);
++	if (mac_addr) {
++		memcpy(dev->net->dev_addr, mac_addr, ETH_ALEN);
++		return;
++	}
++
++	/* try reading mac address from EEPROM */
++	if (smsc95xx_read_eeprom(dev, EEPROM_MAC_OFFSET, ETH_ALEN,
++			dev->net->dev_addr) == 0) {
++		if (is_valid_ether_addr(dev->net->dev_addr)) {
++			/* eeprom values are valid so use them */
++			netif_dbg(dev, ifup, dev->net, "MAC address read from EEPROM\n");
++			return;
++		}
++	}
++
++	/* Check module parameters */
++	if (smsc95xx_is_macaddr_param(dev, dev->net->dev_addr))
++		return;
++
++	/* no useful static MAC address found. generate a random one */
++	eth_hw_addr_random(dev->net);
++	netif_dbg(dev, ifup, dev->net, "MAC address set to eth_random_addr\n");
++}
++
++static int smsc95xx_set_mac_address(struct usbnet *dev)
++{
++	u32 addr_lo = dev->net->dev_addr[0] | dev->net->dev_addr[1] << 8 |
++		dev->net->dev_addr[2] << 16 | dev->net->dev_addr[3] << 24;
++	u32 addr_hi = dev->net->dev_addr[4] | dev->net->dev_addr[5] << 8;
++	int ret;
++
++	ret = smsc95xx_write_reg(dev, ADDRL, addr_lo);
++	if (ret < 0)
++		return ret;
++
++	return smsc95xx_write_reg(dev, ADDRH, addr_hi);
++}
++
++/* starts the TX path */
++static int smsc95xx_start_tx_path(struct usbnet *dev)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	unsigned long flags;
++	int ret;
++
++	/* Enable Tx at MAC */
++	spin_lock_irqsave(&pdata->mac_cr_lock, flags);
++	pdata->mac_cr |= MAC_CR_TXEN_;
++	spin_unlock_irqrestore(&pdata->mac_cr_lock, flags);
++
++	ret = smsc95xx_write_reg(dev, MAC_CR, pdata->mac_cr);
++	if (ret < 0)
++		return ret;
++
++	/* Enable Tx at SCSRs */
++	return smsc95xx_write_reg(dev, TX_CFG, TX_CFG_ON_);
++}
++
++/* Starts the Receive path */
++static int smsc95xx_start_rx_path(struct usbnet *dev, int in_pm)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	unsigned long flags;
++
++	spin_lock_irqsave(&pdata->mac_cr_lock, flags);
++	pdata->mac_cr |= MAC_CR_RXEN_;
++	spin_unlock_irqrestore(&pdata->mac_cr_lock, flags);
++
++	return __smsc95xx_write_reg(dev, MAC_CR, pdata->mac_cr, in_pm);
++}
++
++static int smsc95xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
++{
++	struct usbnet *dev = bus->priv;
++
++	return smsc95xx_mdio_read(dev->net, phy_id, idx);
++}
++
++static int smsc95xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
++                                 u16 regval)
++{
++	struct usbnet *dev = bus->priv;
++
++	smsc95xx_mdio_write(dev->net, phy_id, idx, regval);
++
++	return 0;
++}
++
++static void smsc95xx_handle_link_change(struct net_device *net)
++{
++	phy_print_status(net->phydev);
++}
++
++static int smsc95xx_get_phy_address(struct usbnet *dev)
++{
++	u32 hw_cfg;
++	int ret, id1, id2, phy_addr;
++
++	ret = smsc95xx_read_reg(dev, HW_CFG, &hw_cfg);
++	if (ret < 0)
++		return ret;
++
++	/* if external PHY is not selected */
++	if (!(hw_cfg & HW_CFG_PSEL_))
++		return SMSC95XX_INTERNAL_PHY_ID;
++
++	/*
++	 * Detect external PHY address. Here we probe the MDIO bus from
++	 * the highest address, since some PHYs respond also on address
++	 * zero, which they consider MDIO broadcast address. We really
++	 * want to get their proper address instead though, so we scan
++	 * address zero last.
++	 */
++	for (phy_addr = 0x1f; phy_addr >= 0; phy_addr--) {
++		id1 = smsc95xx_mdio_read(dev->net, phy_addr, MII_PHYSID1);
++		id2 = smsc95xx_mdio_read(dev->net, phy_addr, MII_PHYSID2);
++		/* Check for valid response from the PHY */
++		if (id1 > 0 && id2 > 0 && id1 != 0x7fff && id2 != 0xffff)
++			return phy_addr;
++	}
++
++	netdev_err(dev->net, "cannot detect PHY");
++
++	return -ENODEV;
++}
++
++static int smsc95xx_configure_internal_phy(struct usbnet *dev)
++{
++	int ret;
++
++	smsc95xx_mdio_write(dev->net, dev->mii.phy_id, MII_ADVERTISE,
++		ADVERTISE_ALL | ADVERTISE_CSMA | ADVERTISE_PAUSE_CAP |
++		ADVERTISE_PAUSE_ASYM);
++
++	/* read to clear */
++	ret = smsc95xx_mdio_read(dev->net, dev->mii.phy_id, PHY_INT_SRC);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Failed to read PHY_INT_SRC during init\n");
++		return ret;
++	}
++
++	smsc95xx_mdio_write(dev->net, dev->mii.phy_id, PHY_INT_MASK,
++		PHY_INT_MASK_DEFAULT_);
++
++	return 0;
++}
++
++static int smsc95xx_phy_initialize(struct usbnet *dev)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	struct phy_device *phydev;
++	int ret;
++	const char *id;
++
++	/* Initialize MII structure */
++	dev->mii.dev = dev->net;
++	dev->mii.mdio_read = smsc95xx_mdio_read;
++	dev->mii.mdio_write = smsc95xx_mdio_write;
++	dev->mii.phy_id_mask = 0x1f;
++	dev->mii.reg_num_mask = 0x1f;
++
++	ret = smsc95xx_get_phy_address(dev);
++	if (ret < 0)
++		return ret;
++
++	dev->mii.phy_id = ret;
++
++	pdata->mdiobus = mdiobus_alloc();
++	if (!pdata->mdiobus)
++		return -ENOMEM;
++
++	pdata->mdiobus->priv = dev;
++	pdata->mdiobus->read = smsc95xx_mdiobus_read;
++	pdata->mdiobus->write = smsc95xx_mdiobus_write;
++	pdata->mdiobus->phy_mask = ~(1 << dev->mii.phy_id);
++	pdata->mdiobus->name = "smsc95xx-mdiobus";
++
++	snprintf(pdata->mdiobus->id, MII_BUS_ID_SIZE, "usb-%03d:%03d",
++			dev->udev->bus->busnum, dev->udev->devnum);
++
++	id = pdata->mdiobus->id;
++	ret = mdiobus_register(pdata->mdiobus);
++	if (ret) {
++		netdev_err(dev->net, "can't register MDIO bus\n");
++		goto free_mdiobus;
++	}
++
++	netdev_info(dev->net, "registered mdiobus bus %s\n", id);
++
++	phydev = mdiobus_get_phy(pdata->mdiobus, dev->mii.phy_id);
++	if (!phydev) {
++		netdev_err(dev->net, "bad phydev to %s\n", id);
++		ret = -ENODEV;
++		goto unregister_mdiobus;
++	}
++
++	ret = smsc95xx_mdio_read(dev->net, dev->mii.phy_id, MII_DCOUNTER);
++	if (ret < 0) {
++		netdev_err(dev->net, "Failed to read MII_DCOUNTER (STRAP0)\n");
++		goto unregister_mdiobus;
++	}
++
++	ret = phy_connect_direct(dev->net, phydev, &smsc95xx_handle_link_change,
++				 (ret >> 7) & 0x3);
++	if (ret) {
++		netdev_err(dev->net, "can't attach PHY to %s\n", id);
++		goto unregister_mdiobus;
++	}
++
++	if (dev->mii.phy_id == SMSC95XX_INTERNAL_PHY_ID) {
++		ret = smsc95xx_configure_internal_phy(dev);
++		if (ret < 0)
++			goto disconnect_phy;
++	}
++
++	phy_attached_info(dev->net->phydev);
++	phy_start(dev->net->phydev);
++
++	mii_nway_restart(&dev->mii);
++
++	netif_dbg(dev, ifup, dev->net, "phy initialised successfully\n");
++	return 0;
++
++disconnect_phy:
++	phy_disconnect(dev->net->phydev);
++unregister_mdiobus:
++	mdiobus_unregister(pdata->mdiobus);
++free_mdiobus:
++	mdiobus_free(pdata->mdiobus);
++
++	return ret;
++}
++
++static int smsc95xx_reset(struct usbnet *dev)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	u32 read_buf, write_buf, burst_cap;
++	int ret = 0, timeout;
++
++	netif_dbg(dev, ifup, dev->net, "entering smsc95xx_reset\n");
++
++	ret = smsc95xx_write_reg(dev, HW_CFG, HW_CFG_LRST_);
++	if (ret < 0)
++		return ret;
++
++	timeout = 0;
++	do {
++		msleep(10);
++		ret = smsc95xx_read_reg(dev, HW_CFG, &read_buf);
++		if (ret < 0)
++			return ret;
++		timeout++;
++	} while ((read_buf & HW_CFG_LRST_) && (timeout < 100));
++
++	if (timeout >= 100) {
++		netdev_warn(dev->net, "timeout waiting for completion of Lite Reset\n");
++		return ret;
++	}
++
++	ret = smsc95xx_write_reg(dev, PM_CTRL, PM_CTL_PHY_RST_);
++	if (ret < 0)
++		return ret;
++
++	timeout = 0;
++	do {
++		msleep(10);
++		ret = smsc95xx_read_reg(dev, PM_CTRL, &read_buf);
++		if (ret < 0)
++			return ret;
++		timeout++;
++	} while ((read_buf & PM_CTL_PHY_RST_) && (timeout < 100));
++
++	if (timeout >= 100) {
++		netdev_warn(dev->net, "timeout waiting for PHY Reset\n");
++		return ret;
++	}
++
++	ret = smsc95xx_set_mac_address(dev);
++	if (ret < 0)
++		return ret;
++
++	netif_dbg(dev, ifup, dev->net, "MAC Address: %pM\n",
++		  dev->net->dev_addr);
++
++	ret = smsc95xx_read_reg(dev, HW_CFG, &read_buf);
++	if (ret < 0)
++		return ret;
++
++	netif_dbg(dev, ifup, dev->net, "Read Value from HW_CFG : 0x%08x\n",
++		  read_buf);
++
++	read_buf |= HW_CFG_BIR_;
++
++	ret = smsc95xx_write_reg(dev, HW_CFG, read_buf);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_read_reg(dev, HW_CFG, &read_buf);
++	if (ret < 0)
++		return ret;
++
++	netif_dbg(dev, ifup, dev->net,
++		  "Read Value from HW_CFG after writing HW_CFG_BIR_: 0x%08x\n",
++		  read_buf);
++
++	if (!turbo_mode) {
++		burst_cap = 0;
++		dev->rx_urb_size = packetsize ? packetsize : MAX_SINGLE_PACKET_SIZE;
++	} else if (dev->udev->speed == USB_SPEED_HIGH) {
++		dev->rx_urb_size = packetsize ? packetsize : DEFAULT_HS_BURST_CAP_SIZE;
++		burst_cap = dev->rx_urb_size / HS_USB_PKT_SIZE;
++	} else {
++		dev->rx_urb_size = packetsize ? packetsize : DEFAULT_FS_BURST_CAP_SIZE;
++		burst_cap = dev->rx_urb_size / FS_USB_PKT_SIZE;
++	}
++
++	netif_dbg(dev, ifup, dev->net, "rx_urb_size=%ld\n",
++		  (ulong)dev->rx_urb_size);
++
++	ret = smsc95xx_write_reg(dev, BURST_CAP, burst_cap);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_read_reg(dev, BURST_CAP, &read_buf);
++	if (ret < 0)
++		return ret;
++
++	netif_dbg(dev, ifup, dev->net,
++		  "Read Value from BURST_CAP after writing: 0x%08x\n",
++		  read_buf);
++
++	ret = smsc95xx_write_reg(dev, BULK_IN_DLY, DEFAULT_BULK_IN_DELAY);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_read_reg(dev, BULK_IN_DLY, &read_buf);
++	if (ret < 0)
++		return ret;
++
++	netif_dbg(dev, ifup, dev->net,
++		  "Read Value from BULK_IN_DLY after writing: 0x%08x\n",
++		  read_buf);
++
++	ret = smsc95xx_read_reg(dev, HW_CFG, &read_buf);
++	if (ret < 0)
++		return ret;
++
++	netif_dbg(dev, ifup, dev->net, "Read Value from HW_CFG: 0x%08x\n",
++		  read_buf);
++
++	if (turbo_mode)
++		read_buf |= (HW_CFG_MEF_ | HW_CFG_BCE_);
++
++	read_buf &= ~HW_CFG_RXDOFF_;
++
++	/* set Rx data offset=2, Make IP header aligns on word boundary. */
++	read_buf |= NET_IP_ALIGN << 9;
++
++	ret = smsc95xx_write_reg(dev, HW_CFG, read_buf);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_read_reg(dev, HW_CFG, &read_buf);
++	if (ret < 0)
++		return ret;
++
++	netif_dbg(dev, ifup, dev->net,
++		  "Read Value from HW_CFG after writing: 0x%08x\n", read_buf);
++
++	ret = smsc95xx_write_reg(dev, INT_STS, INT_STS_CLEAR_ALL_);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_read_reg(dev, ID_REV, &read_buf);
++	if (ret < 0)
++		return ret;
++	netif_dbg(dev, ifup, dev->net, "ID_REV = 0x%08x\n", read_buf);
++
++	/* Configure GPIO pins as LED outputs */
++	write_buf = LED_GPIO_CFG_SPD_LED | LED_GPIO_CFG_LNK_LED |
++		LED_GPIO_CFG_FDX_LED;
++	ret = smsc95xx_write_reg(dev, LED_GPIO_CFG, write_buf);
++	if (ret < 0)
++		return ret;
++
++	/* Init Tx */
++	ret = smsc95xx_write_reg(dev, FLOW, 0);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_write_reg(dev, AFC_CFG, AFC_CFG_DEFAULT);
++	if (ret < 0)
++		return ret;
++
++	/* Don't need mac_cr_lock during initialisation */
++	ret = smsc95xx_read_reg(dev, MAC_CR, &pdata->mac_cr);
++	if (ret < 0)
++		return ret;
++
++	/* Init Rx */
++	/* Set Vlan */
++	ret = smsc95xx_write_reg(dev, VLAN1, (u32)ETH_P_8021Q);
++	if (ret < 0)
++		return ret;
++
++	/* Enable or disable checksum offload engines */
++	ret = smsc95xx_set_features(dev->net, dev->net->features);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Failed to set checksum offload features\n");
++		return ret;
++	}
++
++	smsc95xx_set_multicast(dev->net);
++
++	if (!dev->net->phydev) {
++		ret = smsc95xx_phy_initialize(dev);
++		if (ret < 0) {
++			netdev_err(dev->net, "Failed to init PHY\n");
++			return ret;
++		}
++	} else {
++		ret = phy_init_hw(dev->net->phydev);
++		if (ret < 0) {
++			netdev_err(dev->net, "Failed to configure PHY\n");
++			return ret;
++		}
++
++		if (dev->mii.phy_id == SMSC95XX_INTERNAL_PHY_ID) {
++			ret = smsc95xx_configure_internal_phy(dev);
++			if (ret < 0)
++				return ret;
++		}
++	}
++
++	ret = smsc95xx_read_reg(dev, INT_EP_CTL, &read_buf);
++	if (ret < 0)
++		return ret;
++
++	/* enable PHY interrupts */
++	read_buf |= INT_EP_CTL_PHY_INT_;
++
++	ret = smsc95xx_write_reg(dev, INT_EP_CTL, read_buf);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_start_tx_path(dev);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Failed to start TX path\n");
++		return ret;
++	}
++
++	ret = smsc95xx_start_rx_path(dev, 0);
++	if (ret < 0) {
++		netdev_warn(dev->net, "Failed to start RX path\n");
++		return ret;
++	}
++
++	netif_dbg(dev, ifup, dev->net, "smsc95xx_reset, return 0\n");
++	return 0;
++}
++
++static const struct net_device_ops smsc95xx_netdev_ops = {
++	.ndo_open		= usbnet_open,
++	.ndo_stop		= usbnet_stop,
++	.ndo_start_xmit		= usbnet_start_xmit,
++	.ndo_tx_timeout		= usbnet_tx_timeout,
++	.ndo_change_mtu		= usbnet_change_mtu,
++	.ndo_get_stats64	= usbnet_get_stats64,
++	.ndo_set_mac_address 	= eth_mac_addr,
++	.ndo_validate_addr	= eth_validate_addr,
++	.ndo_do_ioctl 		= smsc95xx_ioctl,
++	.ndo_set_rx_mode	= smsc95xx_set_multicast,
++	.ndo_set_features	= smsc95xx_set_features,
++};
++
++static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
++{
++	struct smsc95xx_priv *pdata = NULL;
++	u32 val;
++	int ret;
++
++	printk(KERN_INFO SMSC_CHIPNAME " v" SMSC_DRIVER_VERSION "\n");
++
++	ret = usbnet_get_endpoints(dev, intf);
++	if (ret < 0) {
++		netdev_warn(dev->net, "usbnet_get_endpoints failed: %d\n", ret);
++		return ret;
++	}
++
++	dev->data[0] = (unsigned long)kzalloc(sizeof(struct smsc95xx_priv),
++					      GFP_KERNEL);
++
++	pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	if (!pdata)
++		return -ENOMEM;
++
++	spin_lock_init(&pdata->mac_cr_lock);
++
++	/* LAN95xx devices do not alter the computed checksum of 0 to 0xffff.
++	 * RFC 2460, ipv6 UDP calculated checksum yields a result of zero must
++	 * be changed to 0xffff. RFC 768, ipv4 UDP computed checksum is zero,
++	 * it is transmitted as all ones. The zero transmitted checksum means
++	 * transmitter generated no checksum. Hence, enable csum offload only
++	 * for ipv4 packets.
++	 */
++	if (DEFAULT_TX_CSUM_ENABLE)
++		dev->net->features |= NETIF_F_IP_CSUM;
++	if (DEFAULT_RX_CSUM_ENABLE)
++		dev->net->features |= NETIF_F_RXCSUM;
++
++	dev->net->hw_features = NETIF_F_IP_CSUM | NETIF_F_RXCSUM;
++
++	smsc95xx_init_mac_address(dev);
++
++	/* Init all registers */
++	ret = smsc95xx_reset(dev);
++	if (ret < 0)
++		return ret;
++
++	/* detect device revision as different features may be available */
++	ret = smsc95xx_read_reg(dev, ID_REV, &val);
++	if (ret < 0)
++		return ret;
++	val >>= 16;
++	pdata->chip_id = val;
++	pdata->mdix_ctrl = get_mdix_status(dev->net);
++
++	if ((val == ID_REV_CHIP_ID_9500A_) || (val == ID_REV_CHIP_ID_9530_) ||
++	    (val == ID_REV_CHIP_ID_89530_) || (val == ID_REV_CHIP_ID_9730_))
++		pdata->features = (FEATURE_8_WAKEUP_FILTERS |
++			FEATURE_PHY_NLP_CROSSOVER |
++			FEATURE_REMOTE_WAKEUP);
++	else if (val == ID_REV_CHIP_ID_9512_)
++		pdata->features = FEATURE_8_WAKEUP_FILTERS;
++
++	dev->net->netdev_ops = &smsc95xx_netdev_ops;
++	dev->net->ethtool_ops = &smsc95xx_ethtool_ops;
++	dev->net->flags |= IFF_MULTICAST;
++	dev->net->hard_header_len += SMSC95XX_TX_OVERHEAD_CSUM;
++	dev->hard_mtu = dev->net->mtu + dev->net->hard_header_len;
++
++	pdata->dev = dev;
++	INIT_DELAYED_WORK(&pdata->carrier_check, check_carrier);
++	schedule_delayed_work(&pdata->carrier_check, CARRIER_CHECK_DELAY);
++
++	return 0;
++}
++
++static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++
++	if (pdata) {
++		cancel_delayed_work(&pdata->carrier_check);
++		phy_stop(dev->net->phydev);
++		phy_disconnect(dev->net->phydev);
++		mdiobus_unregister(pdata->mdiobus);
++		mdiobus_free(pdata->mdiobus);
++		netif_dbg(dev, ifdown, dev->net, "free pdata\n");
++		kfree(pdata);
++		pdata = NULL;
++		dev->data[0] = 0;
++	}
++}
++
++static u32 smsc_crc(const u8 *buffer, size_t len, int filter)
++{
++	u32 crc = bitrev16(crc16(0xFFFF, buffer, len));
++	return crc << ((filter % 2) * 16);
++}
++
++static int smsc95xx_enable_phy_wakeup_interrupts(struct usbnet *dev, u16 mask)
++{
++	struct mii_if_info *mii = &dev->mii;
++	int ret;
++
++	netdev_dbg(dev->net, "enabling PHY wakeup interrupts\n");
++
++	/* read to clear */
++	ret = smsc95xx_mdio_read_nopm(dev->net, mii->phy_id, PHY_INT_SRC);
++	if (ret < 0)
++		return ret;
++
++	/* enable interrupt source */
++	ret = smsc95xx_mdio_read_nopm(dev->net, mii->phy_id, PHY_INT_MASK);
++	if (ret < 0)
++		return ret;
++
++	ret |= mask;
++
++	smsc95xx_mdio_write_nopm(dev->net, mii->phy_id, PHY_INT_MASK, ret);
++
++	return 0;
++}
++
++static int smsc95xx_link_ok_nopm(struct usbnet *dev)
++{
++	struct mii_if_info *mii = &dev->mii;
++	int ret;
++
++	/* first, a dummy read, needed to latch some MII phys */
++	ret = smsc95xx_mdio_read_nopm(dev->net, mii->phy_id, MII_BMSR);
++	if (ret < 0)
++		return ret;
++
++	ret = smsc95xx_mdio_read_nopm(dev->net, mii->phy_id, MII_BMSR);
++	if (ret < 0)
++		return ret;
++
++	return !!(ret & BMSR_LSTATUS);
++}
++
++static int smsc95xx_enter_suspend0(struct usbnet *dev)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	u32 val;
++	int ret;
++
++	ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
++	if (ret < 0)
++		return ret;
++
++	val &= (~(PM_CTL_SUS_MODE_ | PM_CTL_WUPS_ | PM_CTL_PHY_RST_));
++	val |= PM_CTL_SUS_MODE_0;
++
++	ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++	if (ret < 0)
++		return ret;
++
++	/* clear wol status */
++	val &= ~PM_CTL_WUPS_;
++	val |= PM_CTL_WUPS_WOL_;
++
++	/* enable energy detection */
++	if (pdata->wolopts & WAKE_PHY)
++		val |= PM_CTL_WUPS_ED_;
++
++	ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++	if (ret < 0)
++		return ret;
++
++	/* read back PM_CTRL */
++	ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
++	if (ret < 0)
++		return ret;
++
++	pdata->suspend_flags |= SUSPEND_SUSPEND0;
++
++	return 0;
++}
++
++static int smsc95xx_enter_suspend1(struct usbnet *dev)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	struct mii_if_info *mii = &dev->mii;
++	u32 val;
++	int ret;
++
++	/* reconfigure link pulse detection timing for
++	 * compatibility with non-standard link partners
++	 */
++	if (pdata->features & FEATURE_PHY_NLP_CROSSOVER)
++		smsc95xx_mdio_write_nopm(dev->net, mii->phy_id,	PHY_EDPD_CONFIG,
++			PHY_EDPD_CONFIG_DEFAULT);
++
++	/* enable energy detect power-down mode */
++	ret = smsc95xx_mdio_read_nopm(dev->net, mii->phy_id, PHY_MODE_CTRL_STS);
++	if (ret < 0)
++		return ret;
++
++	ret |= MODE_CTRL_STS_EDPWRDOWN_;
++
++	smsc95xx_mdio_write_nopm(dev->net, mii->phy_id, PHY_MODE_CTRL_STS, ret);
++
++	/* enter SUSPEND1 mode */
++	ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
++	if (ret < 0)
++		return ret;
++
++	val &= ~(PM_CTL_SUS_MODE_ | PM_CTL_WUPS_ | PM_CTL_PHY_RST_);
++	val |= PM_CTL_SUS_MODE_1;
++
++	ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++	if (ret < 0)
++		return ret;
++
++	/* clear wol status, enable energy detection */
++	val &= ~PM_CTL_WUPS_;
++	val |= (PM_CTL_WUPS_ED_ | PM_CTL_ED_EN_);
++
++	ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++	if (ret < 0)
++		return ret;
++
++	pdata->suspend_flags |= SUSPEND_SUSPEND1;
++
++	return 0;
++}
++
++static int smsc95xx_enter_suspend2(struct usbnet *dev)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	u32 val;
++	int ret;
++
++	ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
++	if (ret < 0)
++		return ret;
++
++	val &= ~(PM_CTL_SUS_MODE_ | PM_CTL_WUPS_ | PM_CTL_PHY_RST_);
++	val |= PM_CTL_SUS_MODE_2;
++
++	ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++	if (ret < 0)
++		return ret;
++
++	pdata->suspend_flags |= SUSPEND_SUSPEND2;
++
++	return 0;
++}
++
++static int smsc95xx_enter_suspend3(struct usbnet *dev)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	u32 val;
++	int ret;
++
++	ret = smsc95xx_read_reg_nopm(dev, RX_FIFO_INF, &val);
++	if (ret < 0)
++		return ret;
++
++	if (val & RX_FIFO_INF_USED_) {
++		netdev_info(dev->net, "rx fifo not empty in autosuspend\n");
++		return -EBUSY;
++	}
++
++	ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
++	if (ret < 0)
++		return ret;
++
++	val &= ~(PM_CTL_SUS_MODE_ | PM_CTL_WUPS_ | PM_CTL_PHY_RST_);
++	val |= PM_CTL_SUS_MODE_3 | PM_CTL_RES_CLR_WKP_STS;
++
++	ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++	if (ret < 0)
++		return ret;
++
++	/* clear wol status */
++	val &= ~PM_CTL_WUPS_;
++	val |= PM_CTL_WUPS_WOL_;
++
++	ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++	if (ret < 0)
++		return ret;
++
++	pdata->suspend_flags |= SUSPEND_SUSPEND3;
++
++	return 0;
++}
++
++static int smsc95xx_autosuspend(struct usbnet *dev, u32 link_up)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	int ret;
++
++	if (!netif_running(dev->net)) {
++		/* interface is ifconfig down so fully power down hw */
++		netdev_dbg(dev->net, "autosuspend entering SUSPEND2\n");
++		return smsc95xx_enter_suspend2(dev);
++	}
++
++	if (!link_up) {
++		/* link is down so enter EDPD mode, but only if device can
++		 * reliably resume from it.  This check should be redundant
++		 * as current FEATURE_REMOTE_WAKEUP parts also support
++		 * FEATURE_PHY_NLP_CROSSOVER but it's included for clarity */
++		if (!(pdata->features & FEATURE_PHY_NLP_CROSSOVER)) {
++			netdev_warn(dev->net, "EDPD not supported\n");
++			return -EBUSY;
++		}
++
++		netdev_dbg(dev->net, "autosuspend entering SUSPEND1\n");
++
++		/* enable PHY wakeup events for if cable is attached */
++		ret = smsc95xx_enable_phy_wakeup_interrupts(dev,
++			PHY_INT_MASK_ANEG_COMP_);
++		if (ret < 0) {
++			netdev_warn(dev->net, "error enabling PHY wakeup ints\n");
++			return ret;
++		}
++
++		netdev_info(dev->net, "entering SUSPEND1 mode\n");
++		return smsc95xx_enter_suspend1(dev);
++	}
++
++	/* enable PHY wakeup events so we remote wakeup if cable is pulled */
++	ret = smsc95xx_enable_phy_wakeup_interrupts(dev,
++		PHY_INT_MASK_LINK_DOWN_);
++	if (ret < 0) {
++		netdev_warn(dev->net, "error enabling PHY wakeup ints\n");
++		return ret;
++	}
++
++	netdev_dbg(dev->net, "autosuspend entering SUSPEND3\n");
++	return smsc95xx_enter_suspend3(dev);
++}
++
++static int smsc95xx_suspend(struct usb_interface *intf, pm_message_t message)
++{
++	struct usbnet *dev = usb_get_intfdata(intf);
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	u32 val, link_up;
++	int ret;
++
++	ret = usbnet_suspend(intf, message);
++	if (ret < 0) {
++		netdev_warn(dev->net, "usbnet_suspend error\n");
++		return ret;
++	}
++
++	if (pdata->suspend_flags) {
++		netdev_warn(dev->net, "error during last resume\n");
++		pdata->suspend_flags = 0;
++	}
++
++	/* determine if link is up using only _nopm functions */
++	link_up = smsc95xx_link_ok_nopm(dev);
++
++	if (message.event == PM_EVENT_AUTO_SUSPEND &&
++	    (pdata->features & FEATURE_REMOTE_WAKEUP)) {
++		ret = smsc95xx_autosuspend(dev, link_up);
++		goto done;
++	}
++
++	/* if we get this far we're not autosuspending */
++	/* if no wol options set, or if link is down and we're not waking on
++	 * PHY activity, enter lowest power SUSPEND2 mode
++	 */
++	if (!(pdata->wolopts & SUPPORTED_WAKE) ||
++		!(link_up || (pdata->wolopts & WAKE_PHY))) {
++		netdev_info(dev->net, "entering SUSPEND2 mode\n");
++
++		/* disable energy detect (link up) & wake up events */
++		ret = smsc95xx_read_reg_nopm(dev, WUCSR, &val);
++		if (ret < 0)
++			goto done;
++
++		val &= ~(WUCSR_MPEN_ | WUCSR_WAKE_EN_);
++
++		ret = smsc95xx_write_reg_nopm(dev, WUCSR, val);
++		if (ret < 0)
++			goto done;
++
++		ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
++		if (ret < 0)
++			goto done;
++
++		val &= ~(PM_CTL_ED_EN_ | PM_CTL_WOL_EN_);
++
++		ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++		if (ret < 0)
++			goto done;
++
++		ret = smsc95xx_enter_suspend2(dev);
++		goto done;
++	}
++
++	if (pdata->wolopts & WAKE_PHY) {
++		ret = smsc95xx_enable_phy_wakeup_interrupts(dev,
++			(PHY_INT_MASK_ANEG_COMP_ | PHY_INT_MASK_LINK_DOWN_));
++		if (ret < 0) {
++			netdev_warn(dev->net, "error enabling PHY wakeup ints\n");
++			goto done;
++		}
++
++		/* if link is down then configure EDPD and enter SUSPEND1,
++		 * otherwise enter SUSPEND0 below
++		 */
++		if (!link_up) {
++			netdev_info(dev->net, "entering SUSPEND1 mode\n");
++			ret = smsc95xx_enter_suspend1(dev);
++			goto done;
++		}
++	}
++
++	if (pdata->wolopts & (WAKE_BCAST | WAKE_MCAST | WAKE_ARP | WAKE_UCAST)) {
++		u32 *filter_mask = kzalloc(sizeof(u32) * 32, GFP_KERNEL);
++		u32 command[2];
++		u32 offset[2];
++		u32 crc[4];
++		int wuff_filter_count =
++			(pdata->features & FEATURE_8_WAKEUP_FILTERS) ?
++			LAN9500A_WUFF_NUM : LAN9500_WUFF_NUM;
++		int i, filter = 0;
++
++		if (!filter_mask) {
++			netdev_warn(dev->net, "Unable to allocate filter_mask\n");
++			ret = -ENOMEM;
++			goto done;
++		}
++
++		memset(command, 0, sizeof(command));
++		memset(offset, 0, sizeof(offset));
++		memset(crc, 0, sizeof(crc));
++
++		if (pdata->wolopts & WAKE_BCAST) {
++			const u8 bcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
++			netdev_info(dev->net, "enabling broadcast detection\n");
++			filter_mask[filter * 4] = 0x003F;
++			filter_mask[filter * 4 + 1] = 0x00;
++			filter_mask[filter * 4 + 2] = 0x00;
++			filter_mask[filter * 4 + 3] = 0x00;
++			command[filter/4] |= 0x05UL << ((filter % 4) * 8);
++			offset[filter/4] |= 0x00 << ((filter % 4) * 8);
++			crc[filter/2] |= smsc_crc(bcast, 6, filter);
++			filter++;
++		}
++
++		if (pdata->wolopts & WAKE_MCAST) {
++			const u8 mcast[] = {0x01, 0x00, 0x5E};
++			netdev_info(dev->net, "enabling multicast detection\n");
++			filter_mask[filter * 4] = 0x0007;
++			filter_mask[filter * 4 + 1] = 0x00;
++			filter_mask[filter * 4 + 2] = 0x00;
++			filter_mask[filter * 4 + 3] = 0x00;
++			command[filter/4] |= 0x09UL << ((filter % 4) * 8);
++			offset[filter/4] |= 0x00  << ((filter % 4) * 8);
++			crc[filter/2] |= smsc_crc(mcast, 3, filter);
++			filter++;
++		}
++
++		if (pdata->wolopts & WAKE_ARP) {
++			const u8 arp[] = {0x08, 0x06};
++			netdev_info(dev->net, "enabling ARP detection\n");
++			filter_mask[filter * 4] = 0x0003;
++			filter_mask[filter * 4 + 1] = 0x00;
++			filter_mask[filter * 4 + 2] = 0x00;
++			filter_mask[filter * 4 + 3] = 0x00;
++			command[filter/4] |= 0x05UL << ((filter % 4) * 8);
++			offset[filter/4] |= 0x0C << ((filter % 4) * 8);
++			crc[filter/2] |= smsc_crc(arp, 2, filter);
++			filter++;
++		}
++
++		if (pdata->wolopts & WAKE_UCAST) {
++			netdev_info(dev->net, "enabling unicast detection\n");
++			filter_mask[filter * 4] = 0x003F;
++			filter_mask[filter * 4 + 1] = 0x00;
++			filter_mask[filter * 4 + 2] = 0x00;
++			filter_mask[filter * 4 + 3] = 0x00;
++			command[filter/4] |= 0x01UL << ((filter % 4) * 8);
++			offset[filter/4] |= 0x00 << ((filter % 4) * 8);
++			crc[filter/2] |= smsc_crc(dev->net->dev_addr, ETH_ALEN, filter);
++			filter++;
++		}
++
++		for (i = 0; i < (wuff_filter_count * 4); i++) {
++			ret = smsc95xx_write_reg_nopm(dev, WUFF, filter_mask[i]);
++			if (ret < 0) {
++				kfree(filter_mask);
++				goto done;
++			}
++		}
++		kfree(filter_mask);
++
++		for (i = 0; i < (wuff_filter_count / 4); i++) {
++			ret = smsc95xx_write_reg_nopm(dev, WUFF, command[i]);
++			if (ret < 0)
++				goto done;
++		}
++
++		for (i = 0; i < (wuff_filter_count / 4); i++) {
++			ret = smsc95xx_write_reg_nopm(dev, WUFF, offset[i]);
++			if (ret < 0)
++				goto done;
++		}
++
++		for (i = 0; i < (wuff_filter_count / 2); i++) {
++			ret = smsc95xx_write_reg_nopm(dev, WUFF, crc[i]);
++			if (ret < 0)
++				goto done;
++		}
++
++		/* clear any pending pattern match packet status */
++		ret = smsc95xx_read_reg_nopm(dev, WUCSR, &val);
++		if (ret < 0)
++			goto done;
++
++		val |= WUCSR_WUFR_;
++
++		ret = smsc95xx_write_reg_nopm(dev, WUCSR, val);
++		if (ret < 0)
++			goto done;
++	}
++
++	if (pdata->wolopts & WAKE_MAGIC) {
++		/* clear any pending magic packet status */
++		ret = smsc95xx_read_reg_nopm(dev, WUCSR, &val);
++		if (ret < 0)
++			goto done;
++
++		val |= WUCSR_MPR_;
++
++		ret = smsc95xx_write_reg_nopm(dev, WUCSR, val);
++		if (ret < 0)
++			goto done;
++	}
++
++	/* enable/disable wakeup sources */
++	ret = smsc95xx_read_reg_nopm(dev, WUCSR, &val);
++	if (ret < 0)
++		goto done;
++
++	if (pdata->wolopts & (WAKE_BCAST | WAKE_MCAST | WAKE_ARP | WAKE_UCAST)) {
++		netdev_info(dev->net, "enabling pattern match wakeup\n");
++		val |= WUCSR_WAKE_EN_;
++	} else {
++		netdev_info(dev->net, "disabling pattern match wakeup\n");
++		val &= ~WUCSR_WAKE_EN_;
++	}
++
++	if (pdata->wolopts & WAKE_MAGIC) {
++		netdev_info(dev->net, "enabling magic packet wakeup\n");
++		val |= WUCSR_MPEN_;
++	} else {
++		netdev_info(dev->net, "disabling magic packet wakeup\n");
++		val &= ~WUCSR_MPEN_;
++	}
++
++	ret = smsc95xx_write_reg_nopm(dev, WUCSR, val);
++	if (ret < 0)
++		goto done;
++
++	/* enable wol wakeup source */
++	ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
++	if (ret < 0)
++		goto done;
++
++	val |= PM_CTL_WOL_EN_;
++
++	/* phy energy detect wakeup source */
++	if (pdata->wolopts & WAKE_PHY)
++		val |= PM_CTL_ED_EN_;
++
++	ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++	if (ret < 0)
++		goto done;
++
++	/* enable receiver to enable frame reception */
++	smsc95xx_start_rx_path(dev, 1);
++
++	/* some wol options are enabled, so enter SUSPEND0 */
++	netdev_info(dev->net, "entering SUSPEND0 mode\n");
++	ret = smsc95xx_enter_suspend0(dev);
++
++done:
++	/*
++	 * TODO: resume() might need to handle the suspend failure
++	 * in system sleep
++	 */
++	if (ret && PMSG_IS_AUTO(message))
++		usbnet_resume(intf);
++	return ret;
++}
++
++static int smsc95xx_resume(struct usb_interface *intf)
++{
++	struct usbnet *dev = usb_get_intfdata(intf);
++	struct smsc95xx_priv *pdata;
++	u8 suspend_flags;
++	int ret;
++	u32 val;
++
++	BUG_ON(!dev);
++	pdata = (struct smsc95xx_priv *)(dev->data[0]);
++	suspend_flags = pdata->suspend_flags;
++
++	netdev_dbg(dev->net, "resume suspend_flags=0x%02x\n", suspend_flags);
++
++	/* do this first to ensure it's cleared even in error case */
++	pdata->suspend_flags = 0;
++	schedule_delayed_work(&pdata->carrier_check, CARRIER_CHECK_DELAY);
++
++	if (suspend_flags & SUSPEND_ALLMODES) {
++		/* clear wake-up sources */
++		ret = smsc95xx_read_reg_nopm(dev, WUCSR, &val);
++		if (ret < 0)
++			return ret;
++
++		val &= ~(WUCSR_WAKE_EN_ | WUCSR_MPEN_);
++
++		ret = smsc95xx_write_reg_nopm(dev, WUCSR, val);
++		if (ret < 0)
++			return ret;
++
++		/* clear wake-up status */
++		ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
++		if (ret < 0)
++			return ret;
++
++		val &= ~PM_CTL_WOL_EN_;
++		val |= PM_CTL_WUPS_;
++
++		ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
++		if (ret < 0)
++			return ret;
++	}
++
++	ret = usbnet_resume(intf);
++	if (ret < 0)
++		netdev_warn(dev->net, "usbnet_resume error\n");
++
++	return ret;
++}
++
++static int smsc95xx_reset_resume(struct usb_interface *intf)
++{
++	struct usbnet *dev = usb_get_intfdata(intf);
++	int ret;
++
++	ret = smsc95xx_reset(dev);
++	if (ret < 0)
++		return ret;
++
++	return smsc95xx_resume(intf);
++}
++
++static void smsc95xx_rx_csum_offload(struct sk_buff *skb)
++{
++	skb->csum = *(u16 *)(skb_tail_pointer(skb) - 2);
++	skb->ip_summed = CHECKSUM_COMPLETE;
++	skb_trim(skb, skb->len - 2);
++}
++
++static int smsc95xx_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
++{
++	/* This check is no longer done by usbnet */
++	if (skb->len < dev->net->hard_header_len)
++		return 0;
++
++	while (skb->len > 0) {
++		u32 header, align_count;
++		struct sk_buff *ax_skb;
++		unsigned char *packet;
++		u16 size;
++
++		memcpy(&header, skb->data, sizeof(header));
++		le32_to_cpus(&header);
++		skb_pull(skb, 4 + NET_IP_ALIGN);
++		packet = skb->data;
++
++		/* get the packet length */
++		size = (u16)((header & RX_STS_FL_) >> 16);
++		align_count = (4 - ((size + NET_IP_ALIGN) % 4)) % 4;
++
++		if (unlikely(header & RX_STS_ES_)) {
++			netif_dbg(dev, rx_err, dev->net,
++				  "Error header=0x%08x\n", header);
++			dev->net->stats.rx_errors++;
++			dev->net->stats.rx_dropped++;
++
++			if (header & RX_STS_CRC_) {
++				dev->net->stats.rx_crc_errors++;
++			} else {
++				if (header & (RX_STS_TL_ | RX_STS_RF_))
++					dev->net->stats.rx_frame_errors++;
++
++				if ((header & RX_STS_LE_) &&
++					(!(header & RX_STS_FT_)))
++					dev->net->stats.rx_length_errors++;
++			}
++		} else {
++			/* ETH_FRAME_LEN + 4(CRC) + 2(COE) + 4(Vlan) */
++			if (unlikely(size > (ETH_FRAME_LEN + 12))) {
++				netif_dbg(dev, rx_err, dev->net,
++					  "size err header=0x%08x\n", header);
++				return 0;
++			}
++
++			/* last frame in this batch */
++			if (skb->len == size) {
++				if (dev->net->features & NETIF_F_RXCSUM)
++					smsc95xx_rx_csum_offload(skb);
++				skb_trim(skb, skb->len - 4); /* remove fcs */
++				if (truesize_mode)
++					skb->truesize = size + sizeof(struct sk_buff);
++
++				return 1;
++			}
++
++			ax_skb = skb_clone(skb, GFP_ATOMIC);
++			if (unlikely(!ax_skb)) {
++				netdev_warn(dev->net, "Error allocating skb\n");
++				return 0;
++			}
++
++			ax_skb->len = size;
++			ax_skb->data = packet;
++			skb_set_tail_pointer(ax_skb, size);
++
++			if (dev->net->features & NETIF_F_RXCSUM)
++				smsc95xx_rx_csum_offload(ax_skb);
++			skb_trim(ax_skb, ax_skb->len - 4); /* remove fcs */
++			if (truesize_mode)
++				ax_skb->truesize = size + sizeof(struct sk_buff);
++
++			usbnet_skb_return(dev, ax_skb);
++		}
++
++		skb_pull(skb, size);
++
++		/* padding bytes before the next frame starts */
++		if (skb->len)
++			skb_pull(skb, align_count);
++	}
++
++	return 1;
++}
++
++static u32 smsc95xx_calc_csum_preamble(struct sk_buff *skb)
++{
++	u16 low_16 = (u16)skb_checksum_start_offset(skb);
++	u16 high_16 = low_16 + skb->csum_offset;
++	return (high_16 << 16) | low_16;
++}
++
++static struct sk_buff *smsc95xx_tx_fixup(struct usbnet *dev,
++					 struct sk_buff *skb, gfp_t flags)
++{
++	bool csum = skb->ip_summed == CHECKSUM_PARTIAL;
++	int overhead = csum ? SMSC95XX_TX_OVERHEAD_CSUM : SMSC95XX_TX_OVERHEAD;
++	u32 tx_cmd_a, tx_cmd_b;
++
++	/* We do not advertise SG, so skbs should be already linearized */
++	BUG_ON(skb_shinfo(skb)->nr_frags);
++
++	/* Make writable and expand header space by overhead if required */
++	if (skb_cow_head(skb, overhead)) {
++		/* Must deallocate here as returning NULL to indicate error
++		 * means the skb won't be deallocated in the caller.
++		 */
++		dev_kfree_skb_any(skb);
++		return NULL;
++	}
++
++	if (csum) {
++		if (skb->len <= 45) {
++			/* workaround - hardware tx checksum does not work
++			 * properly with extremely small packets */
++			long csstart = skb_checksum_start_offset(skb);
++			__wsum calc = csum_partial(skb->data + csstart,
++				skb->len - csstart, 0);
++			*((__sum16 *)(skb->data + csstart
++				+ skb->csum_offset)) = csum_fold(calc);
++
++			csum = false;
++		} else {
++			u32 csum_preamble = smsc95xx_calc_csum_preamble(skb);
++			skb_push(skb, 4);
++			cpu_to_le32s(&csum_preamble);
++			memcpy(skb->data, &csum_preamble, 4);
++		}
++	}
++
++	skb_push(skb, 4);
++	tx_cmd_b = (u32)(skb->len - 4);
++	if (csum)
++		tx_cmd_b |= TX_CMD_B_CSUM_ENABLE;
++	cpu_to_le32s(&tx_cmd_b);
++	memcpy(skb->data, &tx_cmd_b, 4);
++
++	skb_push(skb, 4);
++	tx_cmd_a = (u32)(skb->len - 8) | TX_CMD_A_FIRST_SEG_ |
++		TX_CMD_A_LAST_SEG_;
++	cpu_to_le32s(&tx_cmd_a);
++	memcpy(skb->data, &tx_cmd_a, 4);
++
++	return skb;
++}
++
++static int smsc95xx_manage_power(struct usbnet *dev, int on)
++{
++	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
++
++	dev->intf->needs_remote_wakeup = on;
++
++	if (pdata->features & FEATURE_REMOTE_WAKEUP)
++		return 0;
++
++	/* this chip revision isn't capable of remote wakeup */
++	netdev_info(dev->net, "hardware isn't capable of remote wakeup\n");
++
++	if (on)
++		usb_autopm_get_interface_no_resume(dev->intf);
++	else
++		usb_autopm_put_interface(dev->intf);
++
++	return 0;
++}
++
++static const struct driver_info smsc95xx_info = {
++	.description	= "smsc95xx USB 2.0 Ethernet",
++	.bind		= smsc95xx_bind,
++	.unbind		= smsc95xx_unbind,
++	.link_reset	= smsc95xx_link_reset,
++	.reset		= smsc95xx_reset,
++	.rx_fixup	= smsc95xx_rx_fixup,
++	.tx_fixup	= smsc95xx_tx_fixup,
++	.status		= smsc95xx_status,
++	.manage_power	= smsc95xx_manage_power,
++	.flags		= FLAG_ETHER | FLAG_SEND_ZLP | FLAG_LINK_INTR,
++};
++
++static const struct usb_device_id products[] = {
++	{
++		/* 10BASE-T1S USB Adapter */
++		USB_DEVICE(0x184F, 0x0051),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++#if 0
++	{
++		/* SMSC9500 USB Ethernet Device */
++		USB_DEVICE(0x0424, 0x9500),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9505 USB Ethernet Device */
++		USB_DEVICE(0x0424, 0x9505),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9500A USB Ethernet Device */
++		USB_DEVICE(0x0424, 0x9E00),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9505A USB Ethernet Device */
++		USB_DEVICE(0x0424, 0x9E01),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9512/9514 USB Hub & Ethernet Device */
++		USB_DEVICE(0x0424, 0xec00),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9500 USB Ethernet Device (SAL10) */
++		USB_DEVICE(0x0424, 0x9900),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9505 USB Ethernet Device (SAL10) */
++		USB_DEVICE(0x0424, 0x9901),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9500A USB Ethernet Device (SAL10) */
++		USB_DEVICE(0x0424, 0x9902),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9505A USB Ethernet Device (SAL10) */
++		USB_DEVICE(0x0424, 0x9903),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9512/9514 USB Hub & Ethernet Device (SAL10) */
++		USB_DEVICE(0x0424, 0x9904),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9500A USB Ethernet Device (HAL) */
++		USB_DEVICE(0x0424, 0x9905),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9505A USB Ethernet Device (HAL) */
++		USB_DEVICE(0x0424, 0x9906),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9500 USB Ethernet Device (Alternate ID) */
++		USB_DEVICE(0x0424, 0x9907),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9500A USB Ethernet Device (Alternate ID) */
++		USB_DEVICE(0x0424, 0x9908),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC9512/9514 USB Hub & Ethernet Device (Alternate ID) */
++		USB_DEVICE(0x0424, 0x9909),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC LAN9530 USB Ethernet Device */
++		USB_DEVICE(0x0424, 0x9530),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC LAN9730 USB Ethernet Device */
++		USB_DEVICE(0x0424, 0x9730),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++	{
++		/* SMSC LAN89530 USB Ethernet Device */
++		USB_DEVICE(0x0424, 0x9E08),
++		.driver_info = (unsigned long) &smsc95xx_info,
++	},
++#endif
++	{ },		/* END */
++};
++MODULE_DEVICE_TABLE(usb, products);
++
++static struct usb_driver smsc95xx_driver = {
++	.name		= "smsc95xx_t1s",
++	.id_table	= products,
++	.probe		= usbnet_probe,
++	.suspend	= smsc95xx_suspend,
++	.resume		= smsc95xx_resume,
++	.reset_resume	= smsc95xx_reset_resume,
++	.disconnect	= usbnet_disconnect,
++	.disable_hub_initiated_lpm = 1,
++	.supports_autosuspend = 1,
++};
++
++module_usb_driver(smsc95xx_driver);
++
++MODULE_AUTHOR("Nancy Lin");
++MODULE_AUTHOR("Steve Glendinning <steve.glendinning@shawell.net>");
++MODULE_DESCRIPTION("SMSC95XX USB 2.0 Ethernet Devices");
++MODULE_LICENSE("GPL");
+diff -Naurw ./drivers/staging/t1s/smsc95xx-drv/smsc95xx.h ../kernel-source/drivers/staging/t1s/smsc95xx-drv/smsc95xx.h
+--- ./drivers/staging/t1s/smsc95xx-drv/smsc95xx.h	1970-01-01 01:00:00.000000000 +0100
++++ ../kernel-source/drivers/staging/t1s/smsc95xx-drv/smsc95xx.h	2019-09-12 08:53:06.000000000 +0200
+@@ -0,0 +1,364 @@
++ /***************************************************************************
++ *
++ * Copyright (C) 2007-2008 SMSC
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ *
++ *****************************************************************************/
++
++#ifndef _SMSC95XX_H
++#define _SMSC95XX_H
++
++/* Tx command words */
++#define TX_CMD_A_DATA_OFFSET_	(0x001F0000)	/* Data Start Offset */
++#define TX_CMD_A_FIRST_SEG_	(0x00002000)	/* First Segment */
++#define TX_CMD_A_LAST_SEG_	(0x00001000)	/* Last Segment */
++#define TX_CMD_A_BUF_SIZE_	(0x000007FF)	/* Buffer Size */
++
++#define TX_CMD_B_CSUM_ENABLE	(0x00004000)	/* TX Checksum Enable */
++#define TX_CMD_B_ADD_CRC_DIS_	(0x00002000)	/* Add CRC Disable */
++#define TX_CMD_B_DIS_PADDING_	(0x00001000)	/* Disable Frame Padding */
++#define TX_CMD_B_FRAME_LENGTH_	(0x000007FF)	/* Frame Length (bytes) */
++
++/* Rx status word */
++#define RX_STS_FF_		(0x40000000)	/* Filter Fail */
++#define RX_STS_FL_		(0x3FFF0000)	/* Frame Length */
++#define RX_STS_ES_		(0x00008000)	/* Error Summary */
++#define RX_STS_BF_		(0x00002000)	/* Broadcast Frame */
++#define RX_STS_LE_		(0x00001000)	/* Length Error */
++#define RX_STS_RF_		(0x00000800)	/* Runt Frame */
++#define RX_STS_MF_		(0x00000400)	/* Multicast Frame */
++#define RX_STS_TL_		(0x00000080)	/* Frame too long */
++#define RX_STS_CS_		(0x00000040)	/* Collision Seen */
++#define RX_STS_FT_		(0x00000020)	/* Frame Type */
++#define RX_STS_RW_		(0x00000010)	/* Receive Watchdog */
++#define RX_STS_ME_		(0x00000008)	/* MII Error */
++#define RX_STS_DB_		(0x00000004)	/* Dribbling */
++#define RX_STS_CRC_		(0x00000002)	/* CRC Error */
++
++/* SCSRs - System Control and Status Registers */
++/* Device ID and Revision Register */
++#define ID_REV			(0x00)
++#define ID_REV_CHIP_ID_MASK_	(0xFFFF0000)
++#define ID_REV_CHIP_REV_MASK_	(0x0000FFFF)
++#define ID_REV_CHIP_ID_9500_	(0x9500)
++#define ID_REV_CHIP_ID_9500A_	(0x9E00)
++#define ID_REV_CHIP_ID_9512_	(0xEC00)
++#define ID_REV_CHIP_ID_9530_	(0x9530)
++#define ID_REV_CHIP_ID_89530_	(0x9E08)
++#define ID_REV_CHIP_ID_9730_	(0x9730)
++
++/* Interrupt Status Register */
++#define INT_STS			(0x08)
++#define INT_STS_MAC_RTO_	(0x00040000)	/* MAC Reset Time Out */
++#define INT_STS_TX_STOP_	(0x00020000)	/* TX Stopped */
++#define INT_STS_RX_STOP_	(0x00010000)	/* RX Stopped */
++#define INT_STS_PHY_INT_	(0x00008000)	/* PHY Interrupt */
++#define INT_STS_TXE_		(0x00004000)	/* Transmitter Error */
++#define INT_STS_TDFU_		(0x00002000)	/* TX Data FIFO Underrun */
++#define INT_STS_TDFO_		(0x00001000)	/* TX Data FIFO Overrun */
++#define INT_STS_RXDF_		(0x00000800)	/* RX Dropped Frame */
++#define INT_STS_GPIOS_		(0x000007FF)	/* GPIOs Interrupts */
++#define INT_STS_CLEAR_ALL_	(0xFFFFFFFF)
++
++/* Receive Configuration Register */
++#define RX_CFG			(0x0C)
++#define RX_FIFO_FLUSH_		(0x00000001)	/* Receive FIFO Flush */
++
++/* Transmit Configuration Register */
++#define TX_CFG			(0x10)
++#define TX_CFG_ON_		(0x00000004)	/* Transmitter Enable */
++#define TX_CFG_STOP_		(0x00000002)	/* Stop Transmitter */
++#define TX_CFG_FIFO_FLUSH_	(0x00000001)	/* Transmit FIFO Flush */
++
++/* Hardware Configuration Register */
++#define HW_CFG			(0x14)
++#define HW_CFG_BIR_		(0x00001000)	/* Bulk In Empty Response */
++#define HW_CFG_LEDB_		(0x00000800)	/* Activity LED 80ms Bypass */
++#define HW_CFG_RXDOFF_		(0x00000600)	/* RX Data Offset */
++#define HW_CFG_SBP_		(0x00000100)	/* Stall Bulk Out Pipe Dis. */
++#define HW_CFG_IME_		(0x00000080)	/* Internal MII Visi. Enable */
++#define HW_CFG_DRP_		(0x00000040)	/* Discard Errored RX Frame */
++#define HW_CFG_MEF_		(0x00000020)	/* Mult. ETH Frames/USB pkt */
++#define HW_CFG_ETC_		(0x00000010)	/* EEPROM Timeout Control */
++#define HW_CFG_LRST_		(0x00000008)	/* Soft Lite Reset */
++#define HW_CFG_PSEL_		(0x00000004)	/* External PHY Select */
++#define HW_CFG_BCE_		(0x00000002)	/* Burst Cap Enable */
++#define HW_CFG_SRST_		(0x00000001)	/* Soft Reset */
++
++/* Receive FIFO Information Register */
++#define RX_FIFO_INF		(0x18)
++#define RX_FIFO_INF_USED_	(0x0000FFFF)	/* RX Data FIFO Used Space */
++
++/* Transmit FIFO Information Register */
++#define TX_FIFO_INF		(0x1C)
++#define TX_FIFO_INF_FREE_	(0x0000FFFF)	/* TX Data FIFO Free Space */
++
++/* Power Management Control Register */
++#define PM_CTRL			(0x20)
++#define PM_CTL_RES_CLR_WKP_STS	(0x00000200)	/* Resume Clears Wakeup STS */
++#define PM_CTL_RES_CLR_WKP_EN	(0x00000100)	/* Resume Clears Wkp Enables */
++#define PM_CTL_DEV_RDY_		(0x00000080)	/* Device Ready */
++#define PM_CTL_SUS_MODE_	(0x00000060)	/* Suspend Mode */
++#define PM_CTL_SUS_MODE_0	(0x00000000)
++#define PM_CTL_SUS_MODE_1	(0x00000020)
++#define PM_CTL_SUS_MODE_2	(0x00000040)
++#define PM_CTL_SUS_MODE_3	(0x00000060)
++#define PM_CTL_PHY_RST_		(0x00000010)	/* PHY Reset */
++#define PM_CTL_WOL_EN_		(0x00000008)	/* Wake On Lan Enable */
++#define PM_CTL_ED_EN_		(0x00000004)	/* Energy Detect Enable */
++#define PM_CTL_WUPS_		(0x00000003)	/* Wake Up Status */
++#define PM_CTL_WUPS_NO_		(0x00000000)	/* No Wake Up Event Detected */
++#define PM_CTL_WUPS_ED_		(0x00000001)	/* Energy Detect */
++#define PM_CTL_WUPS_WOL_	(0x00000002)	/* Wake On Lan */
++#define PM_CTL_WUPS_MULTI_	(0x00000003)	/* Multiple Events Occurred */
++
++/* LED General Purpose IO Configuration Register */
++#define LED_GPIO_CFG		(0x24)
++#define LED_GPIO_CFG_SPD_LED	(0x01000000)	/* GPIOz as Speed LED */
++#define LED_GPIO_CFG_LNK_LED	(0x00100000)	/* GPIOy as Link LED */
++#define LED_GPIO_CFG_FDX_LED	(0x00010000)	/* GPIOx as Full Duplex LED */
++
++/* General Purpose IO Configuration Register */
++#define GPIO_CFG		(0x28)
++
++/* Automatic Flow Control Configuration Register */
++#define AFC_CFG			(0x2C)
++#define AFC_CFG_HI_		(0x00FF0000)	/* Auto Flow Ctrl High Level */
++#define AFC_CFG_LO_		(0x0000FF00)	/* Auto Flow Ctrl Low Level */
++#define AFC_CFG_BACK_DUR_	(0x000000F0)	/* Back Pressure Duration */
++#define AFC_CFG_FC_MULT_	(0x00000008)	/* Flow Ctrl on Mcast Frame */
++#define AFC_CFG_FC_BRD_		(0x00000004)	/* Flow Ctrl on Bcast Frame */
++#define AFC_CFG_FC_ADD_		(0x00000002)	/* Flow Ctrl on Addr. Decode */
++#define AFC_CFG_FC_ANY_		(0x00000001)	/* Flow Ctrl on Any Frame */
++/* Hi watermark = 15.5Kb (~10 mtu pkts) */
++/* low watermark = 3k (~2 mtu pkts) */
++/* backpressure duration = ~ 350us */
++/* Apply FC on any frame. */
++#define AFC_CFG_DEFAULT		(0x00F830A1)
++
++/* EEPROM Command Register */
++#define E2P_CMD			(0x30)
++#define E2P_CMD_BUSY_		(0x80000000)	/* E2P Controller Busy */
++#define E2P_CMD_MASK_		(0x70000000)	/* Command Mask (see below) */
++#define E2P_CMD_READ_		(0x00000000)	/* Read Location */
++#define E2P_CMD_EWDS_		(0x10000000)	/* Erase/Write Disable */
++#define E2P_CMD_EWEN_		(0x20000000)	/* Erase/Write Enable */
++#define E2P_CMD_WRITE_		(0x30000000)	/* Write Location */
++#define E2P_CMD_WRAL_		(0x40000000)	/* Write All */
++#define E2P_CMD_ERASE_		(0x50000000)	/* Erase Location */
++#define E2P_CMD_ERAL_		(0x60000000)	/* Erase All */
++#define E2P_CMD_RELOAD_		(0x70000000)	/* Data Reload */
++#define E2P_CMD_TIMEOUT_	(0x00000400)	/* Set if no resp within 30ms */
++#define E2P_CMD_LOADED_		(0x00000200)	/* Valid EEPROM found */
++#define E2P_CMD_ADDR_		(0x000001FF)	/* Byte aligned address */
++
++#define MAX_EEPROM_SIZE		(512)
++
++/* EEPROM Data Register */
++#define E2P_DATA		(0x34)
++#define E2P_DATA_MASK_		(0x000000FF)	/* EEPROM Data Mask */
++
++/* Burst Cap Register */
++#define BURST_CAP		(0x38)
++#define BURST_CAP_MASK_		(0x000000FF)	/* Max burst sent by the UTX */
++
++/* Configuration Straps Status Register */
++#define	STRAP_STATUS			(0x3C)
++#define	STRAP_STATUS_PWR_SEL_		(0x00000020) /* Device self-powered */
++#define	STRAP_STATUS_AMDIX_EN_		(0x00000010) /* Auto-MDIX Enabled */
++#define	STRAP_STATUS_PORT_SWAP_		(0x00000008) /* USBD+/USBD- Swapped */
++#define	STRAP_STATUS_EEP_SIZE_		(0x00000004) /* EEPROM Size */
++#define	STRAP_STATUS_RMT_WKP_		(0x00000002) /* Remote Wkp supported */
++#define	STRAP_STATUS_EEP_DISABLE_	(0x00000001) /* EEPROM Disabled */
++
++/* Data Port Select Register */
++#define DP_SEL			(0x40)
++
++/* Data Port Command Register */
++#define DP_CMD			(0x44)
++
++/* Data Port Address Register */
++#define DP_ADDR			(0x48)
++
++/* Data Port Data 0 Register */
++#define DP_DATA0		(0x4C)
++
++/* Data Port Data 1 Register */
++#define DP_DATA1		(0x50)
++
++/* General Purpose IO Wake Enable and Polarity Register */
++#define GPIO_WAKE		(0x64)
++
++/* Interrupt Endpoint Control Register */
++#define INT_EP_CTL		(0x68)
++#define INT_EP_CTL_INTEP_	(0x80000000)	/* Always TX Interrupt PKT */
++#define INT_EP_CTL_MAC_RTO_	(0x00080000)	/* MAC Reset Time Out */
++#define INT_EP_CTL_RX_FIFO_	(0x00040000)	/* RX FIFO Has Frame */
++#define INT_EP_CTL_TX_STOP_	(0x00020000)	/* TX Stopped */
++#define INT_EP_CTL_RX_STOP_	(0x00010000)	/* RX Stopped */
++#define INT_EP_CTL_PHY_INT_	(0x00008000)	/* PHY Interrupt */
++#define INT_EP_CTL_TXE_		(0x00004000)	/* TX Error */
++#define INT_EP_CTL_TDFU_	(0x00002000)	/* TX Data FIFO Underrun */
++#define INT_EP_CTL_TDFO_	(0x00001000)	/* TX Data FIFO Overrun */
++#define INT_EP_CTL_RXDF_	(0x00000800)	/* RX Dropped Frame */
++#define INT_EP_CTL_GPIOS_	(0x000007FF)	/* GPIOs Interrupt Enable */
++
++/* Bulk In Delay Register (units of 16.667ns, until ~1092µs) */
++#define BULK_IN_DLY		(0x6C)
++
++/* MAC CSRs - MAC Control and Status Registers */
++/* MAC Control Register */
++#define MAC_CR			(0x100)
++#define MAC_CR_RXALL_		(0x80000000)	/* Receive All Mode */
++#define MAC_CR_RCVOWN_		(0x00800000)	/* Disable Receive Own */
++#define MAC_CR_LOOPBK_		(0x00200000)	/* Loopback Operation Mode */
++#define MAC_CR_FDPX_		(0x00100000)	/* Full Duplex Mode */
++#define MAC_CR_MCPAS_		(0x00080000)	/* Pass All Multicast */
++#define MAC_CR_PRMS_		(0x00040000)	/* Promiscuous Mode */
++#define MAC_CR_INVFILT_		(0x00020000)	/* Inverse Filtering */
++#define MAC_CR_PASSBAD_		(0x00010000)	/* Pass Bad Frames */
++#define MAC_CR_HFILT_		(0x00008000)	/* Hash Only Filtering Mode */
++#define MAC_CR_HPFILT_		(0x00002000)	/* Hash/Perfect Filt. Mode */
++#define MAC_CR_LCOLL_		(0x00001000)	/* Late Collision Control */
++#define MAC_CR_BCAST_		(0x00000800)	/* Disable Broadcast Frames */
++#define MAC_CR_DISRTY_		(0x00000400)	/* Disable Retry */
++#define MAC_CR_PADSTR_		(0x00000100)	/* Automatic Pad Stripping */
++#define MAC_CR_BOLMT_MASK	(0x000000C0)	/* BackOff Limit */
++#define MAC_CR_DFCHK_		(0x00000020)	/* Deferral Check */
++#define MAC_CR_TXEN_		(0x00000008)	/* Transmitter Enable */
++#define MAC_CR_RXEN_		(0x00000004)	/* Receiver Enable */
++
++/* MAC Address High Register */
++#define ADDRH			(0x104)
++
++/* MAC Address Low Register */
++#define ADDRL			(0x108)
++
++/* Multicast Hash Table High Register */
++#define HASHH			(0x10C)
++
++/* Multicast Hash Table Low Register */
++#define HASHL			(0x110)
++
++/* MII Access Register */
++#define MII_ADDR		(0x114)
++#define MII_WRITE_		(0x02)
++#define MII_BUSY_		(0x01)
++#define MII_READ_		(0x00) /* ~of MII Write bit */
++
++/* MII Data Register */
++#define MII_DATA		(0x118)
++
++/* Flow Control Register */
++#define FLOW			(0x11C)
++#define FLOW_FCPT_		(0xFFFF0000)	/* Pause Time */
++#define FLOW_FCPASS_		(0x00000004)	/* Pass Control Frames */
++#define FLOW_FCEN_		(0x00000002)	/* Flow Control Enable */
++#define FLOW_FCBSY_		(0x00000001)	/* Flow Control Busy */
++
++/* VLAN1 Tag Register */
++#define VLAN1			(0x120)
++
++/* VLAN2 Tag Register */
++#define VLAN2			(0x124)
++
++/* Wake Up Frame Filter Register */
++#define WUFF			(0x128)
++#define LAN9500_WUFF_NUM	(4)
++#define LAN9500A_WUFF_NUM	(8)
++
++/* Wake Up Control and Status Register */
++#define WUCSR			(0x12C)
++#define WUCSR_WFF_PTR_RST_	(0x80000000)	/* WFrame Filter Pointer Rst */
++#define WUCSR_GUE_		(0x00000200)	/* Global Unicast Enable */
++#define WUCSR_WUFR_		(0x00000040)	/* Wakeup Frame Received */
++#define WUCSR_MPR_		(0x00000020)	/* Magic Packet Received */
++#define WUCSR_WAKE_EN_		(0x00000004)	/* Wakeup Frame Enable */
++#define WUCSR_MPEN_		(0x00000002)	/* Magic Packet Enable */
++
++/* Checksum Offload Engine Control Register */
++#define COE_CR			(0x130)
++#define Tx_COE_EN_		(0x00010000)	/* TX Csum Offload Enable */
++#define Rx_COE_MODE_		(0x00000002)	/* RX Csum Offload Mode */
++#define Rx_COE_EN_		(0x00000001)	/* RX Csum Offload Enable */
++
++/* Vendor-specific PHY Definitions (via MII access) */
++/* EDPD NLP / crossover time configuration (LAN9500A only) */
++#define PHY_EDPD_CONFIG			(16)
++#define PHY_EDPD_CONFIG_TX_NLP_EN_	((u16)0x8000)
++#define PHY_EDPD_CONFIG_TX_NLP_1000_	((u16)0x0000)
++#define PHY_EDPD_CONFIG_TX_NLP_768_	((u16)0x2000)
++#define PHY_EDPD_CONFIG_TX_NLP_512_	((u16)0x4000)
++#define PHY_EDPD_CONFIG_TX_NLP_256_	((u16)0x6000)
++#define PHY_EDPD_CONFIG_RX_1_NLP_	((u16)0x1000)
++#define PHY_EDPD_CONFIG_RX_NLP_64_	((u16)0x0000)
++#define PHY_EDPD_CONFIG_RX_NLP_256_	((u16)0x0400)
++#define PHY_EDPD_CONFIG_RX_NLP_512_	((u16)0x0800)
++#define PHY_EDPD_CONFIG_RX_NLP_1000_	((u16)0x0C00)
++#define PHY_EDPD_CONFIG_EXT_CROSSOVER_	((u16)0x0001)
++#define PHY_EDPD_CONFIG_DEFAULT		(PHY_EDPD_CONFIG_TX_NLP_EN_ | \
++					 PHY_EDPD_CONFIG_TX_NLP_768_ | \
++					 PHY_EDPD_CONFIG_RX_1_NLP_)
++
++/* Mode Control/Status Register */
++#define PHY_MODE_CTRL_STS		(17)
++#define MODE_CTRL_STS_EDPWRDOWN_	((u16)0x2000)
++#define MODE_CTRL_STS_ENERGYON_		((u16)0x0002)
++
++/* Control/Status Indication Register */
++#define SPECIAL_CTRL_STS		(27)
++#define SPECIAL_CTRL_STS_OVRRD_AMDIX_	((u16)0x8000)
++#define SPECIAL_CTRL_STS_AMDIX_ENABLE_	((u16)0x4000)
++#define SPECIAL_CTRL_STS_AMDIX_STATE_	((u16)0x2000)
++
++/* Interrupt Source Register */
++#define PHY_INT_SRC			(29)
++#define PHY_INT_SRC_ENERGY_ON_		((u16)0x0080)
++#define PHY_INT_SRC_ANEG_COMP_		((u16)0x0040)
++#define PHY_INT_SRC_REMOTE_FAULT_	((u16)0x0020)
++#define PHY_INT_SRC_LINK_DOWN_		((u16)0x0010)
++
++/* Interrupt Mask Register */
++#define PHY_INT_MASK			(30)
++#define PHY_INT_MASK_ENERGY_ON_		((u16)0x0080)
++#define PHY_INT_MASK_ANEG_COMP_		((u16)0x0040)
++#define PHY_INT_MASK_REMOTE_FAULT_	((u16)0x0020)
++#define PHY_INT_MASK_LINK_DOWN_		((u16)0x0010)
++#define PHY_INT_MASK_DEFAULT_		(PHY_INT_MASK_ANEG_COMP_ | \
++					 PHY_INT_MASK_LINK_DOWN_)
++/* PHY Special Control/Status Register */
++#define PHY_SPECIAL			(31)
++#define PHY_SPECIAL_SPD_		((u16)0x001C)
++#define PHY_SPECIAL_SPD_10HALF_		((u16)0x0004)
++#define PHY_SPECIAL_SPD_10FULL_		((u16)0x0014)
++#define PHY_SPECIAL_SPD_100HALF_	((u16)0x0008)
++#define PHY_SPECIAL_SPD_100FULL_	((u16)0x0018)
++
++/* USB Vendor Requests */
++#define USB_VENDOR_REQUEST_WRITE_REGISTER	0xA0
++#define USB_VENDOR_REQUEST_READ_REGISTER	0xA1
++#define USB_VENDOR_REQUEST_GET_STATS		0xA2
++
++/* Interrupt Endpoint status word bitfields */
++#define INT_ENP_MAC_RTO_		((u32)BIT(18))	/* MAC Reset Time Out */
++#define INT_ENP_TX_STOP_		((u32)BIT(17))	/* TX Stopped */
++#define INT_ENP_RX_STOP_		((u32)BIT(16))	/* RX Stopped */
++#define INT_ENP_PHY_INT_		((u32)BIT(15))	/* PHY Interrupt */
++#define INT_ENP_TXE_			((u32)BIT(14))	/* TX Error */
++#define INT_ENP_TDFU_			((u32)BIT(13))	/* TX FIFO Underrun */
++#define INT_ENP_TDFO_			((u32)BIT(12))	/* TX FIFO Overrun */
++#define INT_ENP_RXDF_			((u32)BIT(11))	/* RX Dropped Frame */
++
++#endif /* _SMSC95XX_H */
+diff -Naurw ./drivers/staging/t1s/t1s.sh ../kernel-source/drivers/staging/t1s/t1s.sh
+--- ./drivers/staging/t1s/t1s.sh	1970-01-01 01:00:00.000000000 +0100
++++ ../kernel-source/drivers/staging/t1s/t1s.sh	2020-02-11 15:19:02.000000000 +0100
+@@ -0,0 +1,108 @@
++#!/bin/sh
++#
++# /*------------------------------------------------------------------------------------------------*/
++# /* (c) 2020 Microchip Technology Inc. and its subsidiaries.                                       */
++# /*                                                                                                */
++# /* You may use this software and any derivatives exclusively with Microchip products.             */
++# /*                                                                                                */
++# /* THIS SOFTWARE IS SUPPLIED BY MICROCHIP "AS IS".  NO WARRANTIES, WHETHER EXPRESS, IMPLIED OR    */
++# /* STATUTORY, APPLY TO THIS SOFTWARE, INCLUDING ANY IMPLIED WARRANTIES OF NON-INFRINGEMENT,       */
++# /* MERCHANTABILITY, AND FITNESS FOR A PARTICULAR PURPOSE, OR ITS INTERACTION WITH MICROCHIP       */
++# /* PRODUCTS, COMBINATION WITH ANY OTHER PRODUCTS, OR USE IN ANY APPLICATION.                      */
++# /*                                                                                                */
++# /* IN NO EVENT WILL MICROCHIP BE LIABLE FOR ANY INDIRECT, SPECIAL, PUNITIVE, INCIDENTAL OR        */
++# /* CONSEQUENTIAL LOSS, DAMAGE, COST OR EXPENSE OF ANY KIND WHATSOEVER RELATED TO THE SOFTWARE,    */
++# /* HOWEVER CAUSED, EVEN IF MICROCHIP HAS BEEN ADVISED OF THE POSSIBILITY OR THE DAMAGES ARE       */
++# /* FORESEEABLE. TO THE FULLEST EXTENT ALLOWED BY LAW, MICROCHIP'S TOTAL LIABILITY ON ALL CLAIMS   */
++# /* IN ANY WAY RELATED TO THIS SOFTWARE WILL NOT EXCEED THE AMOUNT OF FEES, IF ANY, THAT YOU HAVE  */
++# /* PAID DIRECTLY TO MICROCHIP FOR THIS SOFTWARE.                                                  */
++# /*                                                                                                */
++# /* MICROCHIP PROVIDES THIS SOFTWARE CONDITIONALLY UPON YOUR ACCEPTANCE OF THESE TERMS.            */
++# /*------------------------------------------------------------------------------------------------*/
++#
++# Some general hints:
++# 
++# How to check Kernel version
++# uname -r
++#
++# How to get Kernel Headers
++# sudo apt-get install linux-headers-4.1.19-v7+
++# 
++# How to install GCC
++# sudo apt install build-essential
++# 
++# How to fix DKMS error: "/bin/sh: 1: scripts/basic/fixdep: Exec format error" on make
++# The kernel headers are cross compiled and there's a bug in deb-pkg that packs the build host executables rather than the target executables. Thankfully, the sources are also included with the headers so you just have to recompile the header scripts.
++# There are 4 steps needed to do this:
++# 1) Change to the Linux header directory: cd /usr/src/linux-headers-`uname -r`
++# 1) Install the necessary dependencies: sudo apt-get install -y build-essential bc bison flex libssl-dev
++# 2) Apply the byteshift patch to the headers: wget https://raw.githubusercontent.com/armbian/build/master/patch/misc/headers-debian-byteshift.patch -O - | sudo patch -p1
++# 3) Compile the scripts: sudo make scripts
++# 
++#
++# t1s.sh
++# Roland Trissl (RTR)
++# For support related to this code contact http://www.microchip.com/support
++
++if [ $# -eq 1 ] 
++then
++  echo "\033[36mConfigure 10BASE-T1S adapter as node $1:\033[0m"
++  # Copy required configuration file
++  cp config/PLCA8Nodes-master.driver.bin config/PLCA8Nodes-node0.driver.bin
++  sudo cp config/PLCA8Nodes-node$1.driver.bin /lib/firmware/watson_config.bin
++  # Remove old stuff if there
++  echo "\033[36mRemoved drivers:\033[0m"
++  lsmod | grep 'watson_phy'
++  if [ $? -ne 0  ]
++  then
++    echo -
++  else
++    sudo rmmod watson_phy
++  fi
++  lsmod | grep 'mchp_t1s_phy'
++  if [ $? -ne 0  ]
++  then
++    echo -
++  else
++    sudo rmmod mchp_t1s_phy
++  fi
++  lsmod | grep 'smsc_t1s_mac'
++  if [ $? -ne 0  ]
++  then
++    echo -
++  else
++    sudo rmmod smsc_t1s_mac
++  fi
++  sleep 2
++  # Add the modules
++  sudo insmod mchp_t1s_phy.ko
++  sleep 2
++  sudo insmod smsc_t1s_mac.ko
++  sleep 2
++fi
++
++if [ $# -eq 0 ] 
++then
++  echo "\033[36mUsage: $0 0                 - Configures adapter as node 0 (master) and sets up eth1.\033[0m"
++  echo "\033[36m       $0 1                 - Configures adapter as node 1 and sets up eth1.\033[0m"
++  echo "\033[36m       $0 7                 - Configures adapter as node 7 and sets up eth1.\033[0m"
++  echo "\033[36m       $0 1 x               - Keeps driver configuration, just sets up eth1.\033[0m"
++else
++  # Print info
++  echo "\033[36mPresent drivers:\033[0m"
++  lsmod | grep -iE "mchp|smsc|watson"
++  # Check if adapter is present
++  lsmod | grep 'mchp_t1s_phy           16384  1' >/dev/null
++  if [ $? -ne 0  ]
++  then
++    echo "\033[31m10BASE-T1S adapter not found.\033[0m"
++    #./t1s.sh
++  else
++    echo "\033[32m10BASE-T1S adapter found.\033[0m"
++    ipadr=`expr 10 + $1`
++    sudo ifconfig eth1 192.168.0.$ipadr
++    ifconfig eth1 | grep "inet "
++  fi
++  echo "\033[36mDone.\033[0m"
++fi
++
