@@ -10,7 +10,7 @@ iface wlan0 inet static
         address 192.168.8.1
         netmask 255.255.255.0
         network 192.168.8.0
-        post-up /usr/sbin/udhcpd /etc/udhcpd.conf
+        post-up /usr/sbin/udhcpd /etc/udhcpd_wlan0.conf
 
 # Wired interfaces
 auto eth0
